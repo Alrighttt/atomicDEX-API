@@ -1,8 +1,7 @@
 //! Helpers used in the unit and integration tests.
 
-#![cfg_attr(not(feature = "native"), allow(unused_variables))]
-
 use crate::block_on;
+use bigdecimal::BigDecimal;
 use bytes::Bytes;
 use chrono::{Local, TimeZone};
 use futures::channel::oneshot::channel;
@@ -16,23 +15,82 @@ use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::io::Write;
-#[cfg(not(feature = "native"))] use std::net::SocketAddr;
+#[cfg(target_arch = "wasm32")] use std::net::SocketAddr;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
-#[cfg(feature = "native")] use std::str::from_utf8;
 use std::sync::Mutex;
 use std::thread::sleep;
 use std::time::Duration;
 
 use crate::executor::Timer;
-#[cfg(not(feature = "native"))] use crate::helperᶜ;
+#[cfg(target_arch = "wasm32")] use crate::helperᶜ;
+#[cfg(not(target_arch = "wasm32"))] use crate::log::LogLevel;
 use crate::log::{dashboard_path, LogState};
-#[cfg(not(feature = "native"))]
-use crate::mm_ctx::{MmArc, MmCtxBuilder};
+use crate::mm_ctx::MmArc;
 use crate::mm_metrics::{MetricType, MetricsJson};
-#[cfg(feature = "native")] use crate::wio::{slurp_req, POOL};
+#[cfg(not(target_arch = "wasm32"))]
+use crate::wio::{slurp_req, POOL};
 use crate::{now_float, slurp};
+
+pub const MAKER_SUCCESS_EVENTS: [&str; 11] = [
+    "Started",
+    "Negotiated",
+    "TakerFeeValidated",
+    "MakerPaymentSent",
+    "TakerPaymentReceived",
+    "TakerPaymentWaitConfirmStarted",
+    "TakerPaymentValidatedAndConfirmed",
+    "TakerPaymentSpent",
+    "TakerPaymentSpendConfirmStarted",
+    "TakerPaymentSpendConfirmed",
+    "Finished",
+];
+
+pub const MAKER_ERROR_EVENTS: [&str; 13] = [
+    "StartFailed",
+    "NegotiateFailed",
+    "TakerFeeValidateFailed",
+    "MakerPaymentTransactionFailed",
+    "MakerPaymentDataSendFailed",
+    "MakerPaymentWaitConfirmFailed",
+    "TakerPaymentValidateFailed",
+    "TakerPaymentWaitConfirmFailed",
+    "TakerPaymentSpendFailed",
+    "TakerPaymentSpendConfirmFailed",
+    "MakerPaymentWaitRefundStarted",
+    "MakerPaymentRefunded",
+    "MakerPaymentRefundFailed",
+];
+
+pub const TAKER_SUCCESS_EVENTS: [&str; 10] = [
+    "Started",
+    "Negotiated",
+    "TakerFeeSent",
+    "MakerPaymentReceived",
+    "MakerPaymentWaitConfirmStarted",
+    "MakerPaymentValidatedAndConfirmed",
+    "TakerPaymentSent",
+    "TakerPaymentSpent",
+    "MakerPaymentSpent",
+    "Finished",
+];
+
+pub const TAKER_ERROR_EVENTS: [&str; 13] = [
+    "StartFailed",
+    "NegotiateFailed",
+    "TakerFeeSendFailed",
+    "MakerPaymentValidateFailed",
+    "MakerPaymentWaitConfirmFailed",
+    "TakerPaymentTransactionFailed",
+    "TakerPaymentWaitConfirmFailed",
+    "TakerPaymentDataSendFailed",
+    "TakerPaymentWaitForSpendFailed",
+    "MakerPaymentSpendFailed",
+    "TakerPaymentWaitRefundStarted",
+    "TakerPaymentRefunded",
+    "TakerPaymentRefundFailed",
+];
 
 /// Automatically kill a wrapped process.
 pub struct RaiiKill {
@@ -71,16 +129,16 @@ impl Drop for RaiiKill {
 /// Note that because of https://github.com/rust-lang/rust/issues/42474 it's currently impossible to share the MM log interactively,
 /// hence we're doing it in the `drop`.
 pub struct RaiiDump {
-    #[cfg(feature = "native")]
+    #[cfg(not(target_arch = "wasm32"))]
     pub log_path: PathBuf,
 }
-#[cfg(feature = "native")]
+#[cfg(not(target_arch = "wasm32"))]
 impl Drop for RaiiDump {
     fn drop(&mut self) {
         // `term` bypasses the stdout capturing, we should only use it if the capturing was disabled.
         let nocapture = env::args().any(|a| a == "--nocapture");
 
-        let log = unwrap!(slurp(&self.log_path));
+        let log = slurp(&self.log_path).unwrap();
 
         // Make sure the log is Unicode.
         // We'll get the "io error when listing tests: Custom { kind: InvalidData, error: StringError("text was not valid unicode") }" otherwise.
@@ -106,15 +164,15 @@ lazy_static! {
     static ref MM_IPS: Mutex<HashMap<IpAddr, bool>> = Mutex::new (HashMap::new());
 }
 
-#[cfg(feature = "native")]
+#[cfg(not(target_arch = "wasm32"))]
 pub type LocalStart = fn(PathBuf, PathBuf, Json);
 
-#[cfg(not(feature = "native"))]
+#[cfg(target_arch = "wasm32")]
 pub type LocalStart = fn(MmArc);
 
-/// An instance of a MarketMaker process started by and for an integration test.  
+/// An instance of a MarketMaker process started by and for an integration test.
 /// Given that [in CI] the tests are executed before the build, the binary of that process is the tests binary.
-#[cfg(feature = "native")]
+#[cfg(not(target_arch = "wasm32"))]
 pub struct MarketMakerIt {
     /// The MarketMaker's current folder where it will try to open the database files.
     pub folder: PathBuf,
@@ -129,7 +187,7 @@ pub struct MarketMakerIt {
 }
 
 /// A MarketMaker instance started by and for an integration test.
-#[cfg(not(feature = "native"))]
+#[cfg(target_arch = "wasm32")]
 pub struct MarketMakerIt {
     pub ctx: super::mm_ctx::MmArc,
     /// Unique (to run multiple instances) IP, like "127.0.0.$x".
@@ -138,7 +196,7 @@ pub struct MarketMakerIt {
     pub userpass: String,
 }
 
-#[cfg(feature = "native")]
+#[cfg(not(target_arch = "wasm32"))]
 impl std::fmt::Debug for MarketMakerIt {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
@@ -190,26 +248,26 @@ impl MarketMakerIt {
             ip
         };
 
-        let folder = new_mm2_temp_folder_path(Some(ip));
-        let db_dir = match conf["dbdir"].as_str() {
-            Some(path) => path.into(),
-            None => {
-                let dir = folder.join("DB");
-                conf["dbdir"] = unwrap!(dir.to_str()).into();
-                dir
-            },
-        };
-
-        #[cfg(not(feature = "native"))]
+        #[cfg(target_arch = "wasm32")]
         {
-            let ctx = MmCtxBuilder::new().with_conf(conf).into_mm_arc();
+            let ctx = crate::mm_ctx::MmCtxBuilder::new().with_conf(conf).into_mm_arc();
             let local = try_s!(local.ok_or("!local"));
             local(ctx.clone());
             Ok(MarketMakerIt { ctx, ip, userpass })
         }
 
-        #[cfg(feature = "native")]
+        #[cfg(not(target_arch = "wasm32"))]
         {
+            let folder = new_mm2_temp_folder_path(Some(ip));
+            let db_dir = match conf["dbdir"].as_str() {
+                Some(path) => path.into(),
+                None => {
+                    let dir = folder.join("DB");
+                    conf["dbdir"] = dir.to_str().unwrap().into();
+                    dir
+                },
+            };
+
             try_s!(fs::create_dir(&folder));
             match fs::create_dir(db_dir) {
                 Ok(_) => (),
@@ -220,7 +278,7 @@ impl MarketMakerIt {
                 Some(path) => path.into(),
                 None => {
                     let path = folder.join("mm2.log");
-                    conf["log"] = unwrap!(path.to_str()).into();
+                    conf["log"] = path.to_str().unwrap().into();
                     path
                 },
             };
@@ -259,7 +317,7 @@ impl MarketMakerIt {
         }
     }
 
-    #[cfg(feature = "native")]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn log_as_utf8(&self) -> Result<String, String> {
         let mm_log = try_s!(slurp(&self.log_path));
         let mm_log = unsafe { String::from_utf8_unchecked(mm_log) };
@@ -267,7 +325,7 @@ impl MarketMakerIt {
     }
 
     /// Busy-wait on the log until the `pred` returns `true` or `timeout_sec` expires.
-    #[cfg(feature = "native")]
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn wait_for_log<F>(&mut self, timeout_sec: f64, pred: F) -> Result<(), String>
     where
         F: Fn(&str) -> bool,
@@ -294,7 +352,7 @@ impl MarketMakerIt {
     /// Busy-wait on the log until the `pred` returns `true` or `timeout_sec` expires.
     /// The difference from standard wait_for_log is this function keeps working
     /// after process is stopped
-    #[cfg(feature = "native")]
+    #[cfg(not(target_arch = "wasm32"))]
     pub async fn wait_for_log_after_stop<F>(&mut self, timeout_sec: f64, pred: F) -> Result<(), String>
     where
         F: Fn(&str) -> bool,
@@ -314,7 +372,7 @@ impl MarketMakerIt {
     }
 
     /// Busy-wait on the instance in-memory log until the `pred` returns `true` or `timeout_sec` expires.
-    #[cfg(not(feature = "native"))]
+    #[cfg(target_arch = "wasm32")]
     pub async fn wait_for_log<F>(&mut self, timeout_sec: f64, pred: F) -> Result<(), String>
     where
         F: Fn(&str) -> bool,
@@ -333,48 +391,53 @@ impl MarketMakerIt {
     }
 
     /// Invokes the locally running MM and returns its reply.
+    #[cfg(target_arch = "wasm32")]
     pub async fn rpc(&self, payload: Json) -> Result<(StatusCode, String, HeaderMap), String> {
         let uri = format!("http://{}:7783", self.ip);
-        log!("sending rpc request " (unwrap!(json::to_string(&payload))) " to " (uri));
+        log!("sending rpc request " (json::to_string(&payload).unwrap()) " to " (uri));
+        let empty_payload: Vec<u8> = Vec::new();
+        let request = try_s!(Request::builder().method("POST").uri(uri).body(empty_payload));
+        let (parts, _) = request.into_parts();
+
+        let rpc_service = try_s!(crate::header::RPC_SERVICE.as_option().ok_or("!RPC_SERVICE"));
+        let client: SocketAddr = try_s!("127.0.0.1:1".parse());
+        let f = rpc_service(self.ctx.clone(), parts, payload, client);
+        let response = try_s!(f.await);
+        let (parts, body) = response.into_parts();
+        Ok((parts.status, try_s!(String::from_utf8(body)), parts.headers))
+    }
+
+    /// Invokes the locally running MM and returns its reply.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub async fn rpc(&self, payload: Json) -> Result<(StatusCode, String, HeaderMap), String> {
+        let uri = format!("http://{}:7783", self.ip);
+        log!("sending rpc request " (json::to_string(&payload).unwrap()) " to " (uri));
+
         let payload = try_s!(json::to_vec(&payload));
-        #[cfg(not(feature = "native"))]
-        let payload = futures01::stream::once(Ok(Bytes::from(payload)));
         let request = try_s!(Request::builder().method("POST").uri(uri).body(payload));
-        #[cfg(feature = "native")]
-        {
-            let (status, headers, body) = try_s!(slurp_req(request).await);
-            Ok((status, try_s!(from_utf8(&body)).trim().into(), headers))
-        }
-        #[cfg(not(feature = "native"))]
-        {
-            let rpc_service = try_s!(crate::header::RPC_SERVICE.as_option().ok_or("!RPC_SERVICE"));
-            let (parts, body) = request.into_parts();
-            let client: SocketAddr = try_s!("127.0.0.1:1".parse());
-            let f = rpc_service(self.ctx.clone(), parts, Box::new(body), client);
-            let response = try_s!(f.await);
-            let (parts, body) = response.into_parts();
-            Ok((parts.status, try_s!(String::from_utf8(body)), parts.headers))
-        }
+
+        let (status, headers, body) = try_s!(slurp_req(request).await);
+        Ok((status, try_s!(std::str::from_utf8(&body)).trim().into(), headers))
     }
 
     /// Sends the &str payload to the locally running MM and returns it's reply.
-    #[cfg(feature = "native")]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn rpc_str(&self, payload: &'static str) -> Result<(StatusCode, String, HeaderMap), String> {
         let uri = format!("http://{}:7783", self.ip);
         let request = try_s!(Request::builder().method("POST").uri(uri).body(payload.into()));
         let (status, headers, body) = try_s!(block_on(slurp_req(request)));
-        Ok((status, try_s!(from_utf8(&body)).trim().into(), headers))
+        Ok((status, try_s!(std::str::from_utf8(&body)).trim().into(), headers))
     }
 
-    #[cfg(not(feature = "native"))]
+    #[cfg(target_arch = "wasm32")]
     pub fn rpc_str(&self, _payload: &'static str) -> Result<(StatusCode, String, HeaderMap), String> {
         unimplemented!()
     }
 
-    #[cfg(feature = "native")]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn mm_dump(&self) -> (RaiiDump, RaiiDump) { mm_dump(&self.log_path) }
 
-    #[cfg(not(feature = "native"))]
+    #[cfg(target_arch = "wasm32")]
     pub fn mm_dump(&self) -> (RaiiDump, RaiiDump) { (RaiiDump {}, RaiiDump {}) }
 
     /// Send the "stop" request to the locally running MM.
@@ -399,7 +462,7 @@ impl MarketMakerIt {
     }
 }
 
-#[cfg(feature = "native")]
+#[cfg(not(target_arch = "wasm32"))]
 impl Drop for MarketMakerIt {
     fn drop(&mut self) {
         if let Ok(mut mm_ips) = MM_IPS.lock() {
@@ -418,14 +481,14 @@ impl Drop for MarketMakerIt {
 macro_rules! wait_log_re {
     ($mm_it: expr, $timeout_sec: expr, $re_pred: expr) => {{
         log! ("Waiting for “" ($re_pred) "”…");
-        let re = unwrap! (regex::Regex::new ($re_pred));
+        let re = regex::Regex::new($re_pred).unwrap();
         let rc = $mm_it.wait_for_log ($timeout_sec, |line| re.is_match (line)) .await;
         if let Err (err) = rc {panic! ("{}: {}", $re_pred, err)}
     }};
 }
 
 /// Busy-wait on the log until the `pred` returns `true` or `timeout_sec` expires.
-#[cfg(feature = "native")]
+#[cfg(not(target_arch = "wasm32"))]
 pub fn wait_for_log(log: &LogState, timeout_sec: f64, pred: &dyn Fn(&str) -> bool) -> Result<(), String> {
     let start = now_float();
     let ms = 50.min((timeout_sec * 1000.) as u64 / 20 + 10);
@@ -470,10 +533,10 @@ struct ToWaitForLogRe {
     re_pred: String,
 }
 
-#[cfg(feature = "native")]
+#[cfg(not(target_arch = "wasm32"))]
 pub async fn common_wait_for_log_re(req: Bytes) -> Result<Vec<u8>, String> {
     let args: ToWaitForLogRe = try_s!(json::from_slice(&req));
-    let ctx = try_s!(crate::mm_ctx::MmArc::from_ffi_handle(args.ctx));
+    let ctx = try_s!(MmArc::from_ffi_handle(args.ctx));
     let re = try_s!(Regex::new(&args.re_pred));
 
     // Run the blocking `wait_for_log` in the `POOL`.
@@ -486,14 +549,14 @@ pub async fn common_wait_for_log_re(req: Bytes) -> Result<Vec<u8>, String> {
     Ok(Vec::new())
 }
 
-#[cfg(feature = "native")]
-pub async fn wait_for_log_re(ctx: &crate::mm_ctx::MmArc, timeout_sec: f64, re_pred: &str) -> Result<(), String> {
+#[cfg(not(target_arch = "wasm32"))]
+pub async fn wait_for_log_re(ctx: &MmArc, timeout_sec: f64, re_pred: &str) -> Result<(), String> {
     let re = try_s!(Regex::new(re_pred));
     wait_for_log(&ctx.log, timeout_sec, &|line| re.is_match(line))
 }
 
-#[cfg(not(feature = "native"))]
-pub async fn wait_for_log_re(ctx: &crate::mm_ctx::MmArc, timeout_sec: f64, re_pred: &str) -> Result<(), String> {
+#[cfg(target_arch = "wasm32")]
+pub async fn wait_for_log_re(ctx: &MmArc, timeout_sec: f64, re_pred: &str) -> Result<(), String> {
     try_s!(
         helperᶜ(
             "common_wait_for_log_re",
@@ -509,26 +572,26 @@ pub async fn wait_for_log_re(ctx: &crate::mm_ctx::MmArc, timeout_sec: f64, re_pr
 }
 
 /// Create RAII variables to the effect of dumping the log and the status dashboard at the end of the scope.
-#[cfg(feature = "native")]
+#[cfg(not(target_arch = "wasm32"))]
 pub fn mm_dump(log_path: &Path) -> (RaiiDump, RaiiDump) {
     (
         RaiiDump {
             log_path: log_path.to_path_buf(),
         },
         RaiiDump {
-            log_path: unwrap!(dashboard_path(log_path)),
+            log_path: dashboard_path(log_path).unwrap(),
         },
     )
 }
 
 /// A typical MM instance.
-#[cfg(feature = "native")]
+#[cfg(not(target_arch = "wasm32"))]
 pub fn mm_spat(
     local_start: LocalStart,
     conf_mod: &dyn Fn(Json) -> Json,
 ) -> (&'static str, MarketMakerIt, RaiiDump, RaiiDump) {
     let passphrase = "SPATsRps3dhEtXwtnpRCKF";
-    let mm = unwrap!(MarketMakerIt::start(
+    let mm = MarketMakerIt::start(
         conf_mod(json! ({
             "gui": "nogui",
             "passphrase": passphrase,
@@ -544,13 +607,14 @@ pub fn mm_spat(
         match super::var("LOCAL_THREAD_MM") {
             Ok(ref e) if e == "1" => Some(local_start),
             _ => None,
-        }
-    ));
+        },
+    )
+    .unwrap();
     let (dump_log, dump_dashboard) = mm_dump(&mm.log_path);
     (passphrase, mm, dump_log, dump_dashboard)
 }
 
-#[cfg(not(feature = "native"))]
+#[cfg(target_arch = "wasm32")]
 pub fn mm_spat(
     _local_start: LocalStart,
     _conf_mod: &dyn Fn(Json) -> Json,
@@ -560,18 +624,19 @@ pub fn mm_spat(
 
 /// Asks MM to enable the given currency in electrum mode
 /// fresh list of servers at https://github.com/jl777/coins/blob/master/electrums/.
-pub async fn enable_electrum(mm: &MarketMakerIt, coin: &str, urls: Vec<&str>) -> Json {
-    let servers: Vec<_> = urls.into_iter().map(|url| json!({ "url": url })).collect();
-    let electrum = unwrap!(
-        mm.rpc(json! ({
+pub async fn enable_electrum(mm: &MarketMakerIt, coin: &str, tx_history: bool, urls: &[&str]) -> Json {
+    let servers: Vec<_> = urls.iter().map(|url| json!({ "url": url })).collect();
+    let electrum = mm
+        .rpc(json! ({
             "userpass": mm.userpass,
             "method": "electrum",
             "coin": coin,
             "servers": servers,
             "mm2": 1,
+            "tx_history": tx_history,
         }))
         .await
-    );
+        .unwrap();
     assert_eq!(
         electrum.0,
         StatusCode::OK,
@@ -579,13 +644,13 @@ pub async fn enable_electrum(mm: &MarketMakerIt, coin: &str, urls: Vec<&str>) ->
         electrum.0,
         electrum.1
     );
-    unwrap!(json::from_str(&electrum.1))
+    json::from_str(&electrum.1).unwrap()
 }
 
 pub async fn enable_qrc20(mm: &MarketMakerIt, coin: &str, urls: &[&str], swap_contract_address: &str) -> Json {
     let servers: Vec<_> = urls.iter().map(|url| json!({ "url": url })).collect();
-    let electrum = unwrap!(
-        mm.rpc(json! ({
+    let electrum = mm
+        .rpc(json! ({
             "userpass": mm.userpass,
             "method": "electrum",
             "coin": coin,
@@ -594,7 +659,7 @@ pub async fn enable_qrc20(mm: &MarketMakerIt, coin: &str, urls: &[&str], swap_co
             "swap_contract_address": swap_contract_address,
         }))
         .await
-    );
+        .unwrap();
     assert_eq!(
         electrum.0,
         StatusCode::OK,
@@ -602,20 +667,23 @@ pub async fn enable_qrc20(mm: &MarketMakerIt, coin: &str, urls: &[&str], swap_co
         electrum.0,
         electrum.1
     );
-    unwrap!(json::from_str(&electrum.1))
+    json::from_str(&electrum.1).unwrap()
 }
 
 /// Reads passphrase and userpass from .env file
 pub fn from_env_file(env: Vec<u8>) -> (Option<String>, Option<String>) {
     use regex::bytes::Regex;
     let (mut passphrase, mut userpass) = (None, None);
-    for cap in unwrap!(Regex::new(r"(?m)^(PASSPHRASE|USERPASS)=(\w[\w ]+)$")).captures_iter(&env) {
+    for cap in Regex::new(r"(?m)^(PASSPHRASE|USERPASS)=(\w[\w ]+)$")
+        .unwrap()
+        .captures_iter(&env)
+    {
         match cap.get(1) {
             Some(name) if name.as_bytes() == b"PASSPHRASE" => {
-                passphrase = cap.get(2).map(|v| unwrap!(String::from_utf8(v.as_bytes().into())))
+                passphrase = cap.get(2).map(|v| String::from_utf8(v.as_bytes().into()).unwrap())
             },
             Some(name) if name.as_bytes() == b"USERPASS" => {
-                userpass = cap.get(2).map(|v| unwrap!(String::from_utf8(v.as_bytes().into())))
+                userpass = cap.get(2).map(|v| String::from_utf8(v.as_bytes().into()).unwrap())
             },
             _ => (),
         }
@@ -623,7 +691,7 @@ pub fn from_env_file(env: Vec<u8>) -> (Option<String>, Option<String>) {
     (passphrase, userpass)
 }
 
-#[cfg(not(feature = "native"))] use std::os::raw::c_char;
+#[cfg(target_arch = "wasm32")] use std::os::raw::c_char;
 
 /// Reads passphrase from file or environment.
 pub fn get_passphrase(path: &dyn AsRef<Path>, env: &str) -> Result<String, String> {
@@ -640,9 +708,9 @@ pub fn get_passphrase(path: &dyn AsRef<Path>, env: &str) -> Result<String, Strin
 
 /// Asks MM to enable the given currency in native mode.
 /// Returns the RPC reply containing the corresponding wallet address.
-pub async fn enable_native(mm: &MarketMakerIt, coin: &str, urls: Vec<&str>) -> Json {
-    let native = unwrap!(
-        mm.rpc(json! ({
+pub async fn enable_native(mm: &MarketMakerIt, coin: &str, urls: &[&str]) -> Json {
+    let native = mm
+        .rpc(json! ({
             "userpass": mm.userpass,
             "method": "enable",
             "coin": coin,
@@ -652,9 +720,9 @@ pub async fn enable_native(mm: &MarketMakerIt, coin: &str, urls: Vec<&str>) -> J
             "mm2": 1,
         }))
         .await
-    );
+        .unwrap();
     assert_eq!(native.0, StatusCode::OK, "'enable' failed: {}", native.1);
-    unwrap!(json::from_str(&native.1))
+    json::from_str(&native.1).unwrap()
 }
 
 /// Use a separate (unique) temporary folder for each MM.
@@ -699,4 +767,107 @@ pub fn find_metrics_in_json(
 
         true
     })
+}
+
+/// Helper function requesting my swap status and checking it's events
+pub async fn check_my_swap_status(
+    mm: &MarketMakerIt,
+    uuid: &str,
+    expected_success_events: &[&str],
+    expected_error_events: &[&str],
+    maker_amount: BigDecimal,
+    taker_amount: BigDecimal,
+) {
+    let response = mm
+        .rpc(json! ({
+            "userpass": mm.userpass,
+            "method": "my_swap_status",
+            "params": {
+                "uuid": uuid,
+            }
+        }))
+        .await
+        .unwrap();
+    assert!(response.0.is_success(), "!status of {}: {}", uuid, response.1);
+    let status_response: Json = json::from_str(&response.1).unwrap();
+    let success_events: Vec<String> = json::from_value(status_response["result"]["success_events"].clone()).unwrap();
+    assert_eq!(expected_success_events, success_events.as_slice());
+    let error_events: Vec<String> = json::from_value(status_response["result"]["error_events"].clone()).unwrap();
+    assert_eq!(expected_error_events, error_events.as_slice());
+
+    let events_array = status_response["result"]["events"].as_array().unwrap();
+    let actual_maker_amount = json::from_value(events_array[0]["event"]["data"]["maker_amount"].clone()).unwrap();
+    assert_eq!(maker_amount, actual_maker_amount);
+    let actual_taker_amount = json::from_value(events_array[0]["event"]["data"]["taker_amount"].clone()).unwrap();
+    assert_eq!(taker_amount, actual_taker_amount);
+    let actual_events = events_array.iter().map(|item| item["event"]["type"].as_str().unwrap());
+    let actual_events: Vec<&str> = actual_events.collect();
+    assert_eq!(expected_success_events, actual_events.as_slice());
+}
+
+pub async fn check_stats_swap_status(
+    mm: &MarketMakerIt,
+    uuid: &str,
+    maker_expected_events: &[&str],
+    taker_expected_events: &[&str],
+) {
+    let response = mm
+        .rpc(json! ({
+            "method": "stats_swap_status",
+            "params": {
+                "uuid": uuid,
+            }
+        }))
+        .await
+        .unwrap();
+    assert!(response.0.is_success(), "!status of {}: {}", uuid, response.1);
+    let status_response: Json = json::from_str(&response.1).unwrap();
+    let maker_events_array = status_response["result"]["maker"]["events"].as_array().unwrap();
+    let taker_events_array = status_response["result"]["taker"]["events"].as_array().unwrap();
+    let maker_actual_events = maker_events_array
+        .iter()
+        .map(|item| item["event"]["type"].as_str().unwrap());
+    let maker_actual_events: Vec<&str> = maker_actual_events.collect();
+    let taker_actual_events = taker_events_array
+        .iter()
+        .map(|item| item["event"]["type"].as_str().unwrap());
+    let taker_actual_events: Vec<&str> = taker_actual_events.collect();
+    assert_eq!(maker_expected_events, maker_actual_events.as_slice());
+    assert_eq!(taker_expected_events, taker_actual_events.as_slice());
+}
+
+pub async fn check_recent_swaps(mm: &MarketMakerIt, expected_len: usize) {
+    let response = mm
+        .rpc(json! ({
+            "method": "my_recent_swaps",
+            "userpass": mm.userpass,
+        }))
+        .await
+        .unwrap();
+    assert!(response.0.is_success(), "!status of my_recent_swaps {}", response.1);
+    let swaps_response: Json = json::from_str(&response.1).unwrap();
+    let swaps: &Vec<Json> = swaps_response["result"]["swaps"].as_array().unwrap();
+    assert_eq!(expected_len, swaps.len());
+}
+
+/// Ensure the `RUST_LOG` environment variable is expected.
+///
+/// # Panic
+///
+/// Panic if the `RUST_LOG` environment variable doesn't equal to the `required_level`.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn require_log_level(expected: &[LogLevel]) {
+    let actual = match LogLevel::from_env() {
+        Some(level) => level,
+        None => panic!(
+            "Expected one of the {:?} log levels. It seems `RUST_LOG` env is not set",
+            expected
+        ),
+    };
+    assert!(
+        expected.contains(&actual),
+        "Expected one of {:?} log levels, found '{:?}'",
+        expected,
+        actual,
+    );
 }

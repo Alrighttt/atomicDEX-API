@@ -19,26 +19,25 @@
 //  Copyright © 2017-2019 SuperNET. All rights reserved.
 //
 
-#![cfg_attr(not(feature = "native"), allow(unused_imports))]
-
 pub mod qtum;
 pub mod rpc_clients;
 pub mod utxo_common;
 pub mod utxo_standard;
 
-#[cfg(feature = "native")] pub mod tx_cache;
+#[cfg(not(target_arch = "wasm32"))] pub mod tx_cache;
 
 use async_trait::async_trait;
-use base64::{encode_config as base64_encode, URL_SAFE};
 use bigdecimal::BigDecimal;
 pub use bitcrypto::{dhash160, sha256, ChecksumType};
-use chain::{OutPoint, TransactionInput, TransactionOutput};
+use chain::{OutPoint, TransactionInput, TransactionOutput, TxHashAlgo};
 use common::executor::{spawn, Timer};
+#[cfg(not(target_arch = "wasm32"))]
+use common::first_char_to_upper;
 use common::jsonrpc_client::JsonRpcError;
 use common::mm_ctx::MmArc;
 use common::mm_metrics::MetricsArc;
-use common::{first_char_to_upper, small_rng, MM_VERSION};
-#[cfg(feature = "native")] use dirs::home_dir;
+use common::{small_rng, MM_VERSION};
+#[cfg(not(target_arch = "wasm32"))] use dirs::home_dir;
 use futures::channel::mpsc;
 use futures::compat::Future01CompatExt;
 use futures::lock::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
@@ -58,20 +57,23 @@ use std::collections::{HashMap, HashSet};
 use std::convert::TryInto;
 use std::num::NonZeroU64;
 use std::ops::Deref;
-use std::path::{Path, PathBuf};
+#[cfg(not(target_arch = "wasm32"))] use std::path::Path;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex, Weak};
-use utxo_common::big_decimal_from_sat;
+use utxo_common::{big_decimal_from_sat, display_address};
 
 pub use chain::Transaction as UtxoTx;
 
-use self::rpc_clients::{ElectrumClient, ElectrumClientImpl, EstimateFeeMethod, EstimateFeeMode, NativeClient,
+use self::rpc_clients::{ElectrumClient, ElectrumClientImpl, ElectrumRpcRequest, EstimateFeeMethod, EstimateFeeMode,
                         UnspentInfo, UtxoRpcClientEnum};
-use super::{CoinTransportMetrics, CoinsContext, FoundSwapTxSpend, HistorySyncState, MarketCoinOps, MmCoin,
-            RpcClientType, RpcTransportEventHandler, RpcTransportEventHandlerShared, TradeFee, Transaction,
-            TransactionDetails, TransactionEnum, TransactionFut, WithdrawFee, WithdrawRequest};
-use crate::utxo::rpc_clients::{ElectrumRpcRequest, NativeClientImpl};
+#[cfg(not(target_arch = "wasm32"))]
+use self::rpc_clients::{NativeClient, NativeClientImpl};
+use super::{CoinTransportMetrics, CoinsContext, FeeApproxStage, FoundSwapTxSpend, HistorySyncState, MarketCoinOps,
+            MmCoin, RpcClientType, RpcTransportEventHandler, RpcTransportEventHandlerShared, TradeFee,
+            TradePreimageError, Transaction, TransactionDetails, TransactionEnum, TransactionFut, WithdrawFee,
+            WithdrawRequest};
 
 #[cfg(test)] pub mod utxo_tests;
 
@@ -82,14 +84,16 @@ const MAX_DER_SIGNATURE_LEN: usize = 72;
 const COMPRESSED_PUBKEY_LEN: usize = 33;
 const P2PKH_OUTPUT_LEN: u64 = 34;
 const MATURE_CONFIRMATIONS_DEFAULT: u32 = 100;
+const UTXO_DUST_AMOUNT: u64 = 1000;
 /// Block count for KMD median time past calculation
 ///
 /// # Safety
 /// 11 > 0
 const KMD_MTP_BLOCK_COUNT: NonZeroU64 = unsafe { NonZeroU64::new_unchecked(11u64) };
+const DEFAULT_DYNAMIC_FEE_VOLATILITY_PERCENT: f64 = 0.5;
 
 #[cfg(windows)]
-#[cfg(feature = "native")]
+#[cfg(not(target_arch = "wasm32"))]
 fn get_special_folder_path() -> PathBuf {
     use libc::c_char;
     use std::ffi::CStr;
@@ -105,11 +109,11 @@ fn get_special_folder_path() -> PathBuf {
     if rc != 1 {
         panic!("!SHGetSpecialFolderPathA")
     }
-    Path::new(unwrap!(unsafe { CStr::from_ptr(buf.as_ptr()) }.to_str())).to_path_buf()
+    Path::new(unsafe { CStr::from_ptr(buf.as_ptr()) }.to_str().unwrap()).to_path_buf()
 }
 
 #[cfg(not(windows))]
-#[cfg(feature = "native")]
+#[cfg(not(target_arch = "wasm32"))]
 fn get_special_folder_path() -> PathBuf { panic!("!windows") }
 
 impl Transaction for UtxoTx {
@@ -126,6 +130,7 @@ pub struct AdditionalTxData {
     pub received_by_me: u64,
     pub spent_by_me: u64,
     pub fee_amount: u64,
+    pub unused_change: Option<u64>,
 }
 
 /// The fee set from coins config
@@ -135,6 +140,7 @@ pub enum TxFee {
     Fixed(u64),
     /// Tell the coin that it should request the fee from daemon RPC and calculate it relying on tx size
     Dynamic(EstimateFeeMethod),
+    FixedPerKb(u64),
 }
 
 /// The actual "runtime" fee that is received from RPC in case of dynamic calculation
@@ -144,6 +150,9 @@ pub enum ActualTxFee {
     Fixed(u64),
     /// fee amount per Kbyte received from coin RPC
     Dynamic(u64),
+    /// Use specified amount per each 1 kb of transaction and also per each output less than amount.
+    /// Used by DOGE, but more coins might support it too.
+    FixedPerKb(u64),
 }
 
 /// Fee policy applied on transaction creation
@@ -171,14 +180,39 @@ impl Default for UtxoAddressFormat {
     fn default() -> Self { UtxoAddressFormat::Standard }
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct CachedUnspentInfo {
+    pub outpoint: OutPoint,
+    pub value: u64,
+}
+
+impl From<UnspentInfo> for CachedUnspentInfo {
+    fn from(unspent: UnspentInfo) -> CachedUnspentInfo {
+        CachedUnspentInfo {
+            outpoint: unspent.outpoint,
+            value: unspent.value,
+        }
+    }
+}
+
+impl From<CachedUnspentInfo> for UnspentInfo {
+    fn from(cached: CachedUnspentInfo) -> UnspentInfo {
+        UnspentInfo {
+            outpoint: cached.outpoint,
+            value: cached.value,
+            height: None,
+        }
+    }
+}
+
 /// The cache of recently send transactions used to track the spent UTXOs and replace them with new outputs
 /// The daemon needs some time to update the listunspent list for address which makes it return already spent UTXOs
 /// This cache helps to prevent UTXO reuse in such cases
 pub struct RecentlySpentOutPoints {
-    /// Maps UnspentInfo A to a set of UnspentInfos which `spent` A
-    input_to_output_map: HashMap<UnspentInfo, HashSet<UnspentInfo>>,
-    /// Maps UnspentInfo A to a set of UnspentInfos that `were spent by` A
-    output_to_input_map: HashMap<UnspentInfo, HashSet<UnspentInfo>>,
+    /// Maps CachedUnspentInfo A to a set of CachedUnspentInfo which `spent` A
+    input_to_output_map: HashMap<CachedUnspentInfo, HashSet<CachedUnspentInfo>>,
+    /// Maps CachedUnspentInfo A to a set of CachedUnspentInfo that `were spent by` A
+    output_to_input_map: HashMap<CachedUnspentInfo, HashSet<CachedUnspentInfo>>,
     /// Cache includes only outputs having script_pubkey == for_script_pubkey
     for_script_pubkey: Bytes,
 }
@@ -192,22 +226,19 @@ impl RecentlySpentOutPoints {
         }
     }
 
-    pub fn add_spent(&mut self, mut inputs: Vec<UnspentInfo>, spend_tx_hash: H256, outputs: Vec<TransactionOutput>) {
-        // reset the height for all inputs as spent cache is not aware about block height of spent output
-        inputs.iter_mut().for_each(|input| input.height = None);
-        let inputs: HashSet<_> = inputs.into_iter().collect();
+    pub fn add_spent(&mut self, inputs: Vec<UnspentInfo>, spend_tx_hash: H256, outputs: Vec<TransactionOutput>) {
+        let inputs: HashSet<_> = inputs.into_iter().map(From::from).collect();
         let to_replace: HashSet<_> = outputs
             .iter()
             .enumerate()
             .filter_map(|(index, output)| {
                 if output.script_pubkey == self.for_script_pubkey {
-                    Some(UnspentInfo {
+                    Some(CachedUnspentInfo {
                         outpoint: OutPoint {
                             hash: spend_tx_hash.clone(),
                             index: index as u32,
                         },
                         value: output.value,
-                        height: None,
                     })
                 } else {
                     None
@@ -245,18 +276,10 @@ impl RecentlySpentOutPoints {
 
     pub fn replace_spent_outputs_with_cache(&self, mut outputs: HashSet<UnspentInfo>) -> HashSet<UnspentInfo> {
         let mut replacement_unspents = HashSet::new();
-        // reset the height for all outputs as spent cache is not aware about block height of a just sent tx
-        outputs = outputs
-            .into_iter()
-            .map(|mut output| {
-                output.height = None;
-                output
-            })
-            .collect();
         outputs = outputs
             .into_iter()
             .filter(|unspent| {
-                let outs = self.input_to_output_map.get(&unspent);
+                let outs = self.input_to_output_map.get(&unspent.clone().into());
                 match outs {
                     Some(outs) => {
                         for out in outs.iter() {
@@ -273,13 +296,23 @@ impl RecentlySpentOutPoints {
         if replacement_unspents.is_empty() {
             return outputs;
         }
-        outputs.extend(replacement_unspents);
+        outputs.extend(replacement_unspents.into_iter().map(From::from));
         self.replace_spent_outputs_with_cache(outputs)
     }
 }
 
+#[derive(Debug, Deserialize)]
+pub enum BlockchainNetwork {
+    #[serde(rename = "mainnet")]
+    Mainnet,
+    #[serde(rename = "testnet")]
+    Testnet,
+    #[serde(rename = "regtest")]
+    Regtest,
+}
+
 #[derive(Debug)]
-pub struct UtxoCoinFields {
+pub struct UtxoCoinConf {
     pub ticker: String,
     /// https://en.bitcoin.it/wiki/List_of_address_prefixes
     /// https://github.com/jl777/coins/blob/master/coins
@@ -308,27 +341,16 @@ pub struct UtxoCoinFields {
     /// will be the Segwit (starting from 3 for BTC case) instead of legacy
     /// https://en.bitcoin.it/wiki/Segregated_Witness
     pub segwit: bool,
-    /// Default decimals amount is 8 (BTC and almost all other UTXO coins)
-    /// But there are forks which have different decimals:
-    /// Peercoin has 6
-    /// Emercoin has 6
-    /// Bitcoin Diamond has 7
-    pub decimals: u8,
     /// Does coin require transactions to be notarized to be considered as confirmed?
     /// https://komodoplatform.com/security-delayed-proof-of-work-dpow/
     pub requires_notarization: AtomicBool,
-    /// RPC client
-    pub rpc_client: UtxoRpcClientEnum,
-    /// ECDSA key pair
-    pub key_pair: KeyPair,
-    /// Lock the mutex when we deal with address utxos
-    pub my_address: Address,
     /// The address format indicates how to parse and display UTXO addresses over RPC calls
     pub address_format: UtxoAddressFormat,
     /// Is current coin KMD asset chain?
     /// https://komodoplatform.atlassian.net/wiki/spaces/KPSD/pages/71729160/What+is+a+Parallel+Chain+Asset+Chain
     pub asset_chain: bool,
-    pub tx_fee: TxFee,
+    /// Dynamic transaction fee volatility in percent. The value is used to predict a possible increase in dynamic fee.
+    pub tx_fee_volatility_percent: f64,
     /// Transaction version group id for Zcash transactions since Overwinter: https://github.com/zcash/zips/blob/master/zip-0202.rst
     pub version_group_id: u32,
     /// Consensus branch id for Zcash transactions since Overwinter: https://github.com/zcash/zcash/blob/master/src/consensus/upgrades.cpp#L11
@@ -342,7 +364,6 @@ pub struct UtxoCoinFields {
     pub fork_id: u32,
     /// Signature version
     pub signature_version: SignatureVersion,
-    pub history_sync_state: Mutex<HistorySyncState>,
     pub required_confirmations: AtomicU64,
     /// if set to true MM2 will check whether calculated fee is lower than relay fee and use
     /// relay fee amount instead of calculated
@@ -351,20 +372,43 @@ pub struct UtxoCoinFields {
     /// Block count for median time past calculation
     pub mtp_block_count: NonZeroU64,
     pub estimate_fee_mode: Option<EstimateFeeMode>,
+    /// The minimum number of confirmations at which a transaction is considered mature
+    pub mature_confirmations: u32,
+    /// The number of blocks used for estimate_fee/estimate_smart_fee RPC calls
+    pub estimate_fee_blocks: u32,
+}
+
+#[derive(Debug)]
+pub struct UtxoCoinFields {
+    /// UTXO coin config
+    pub conf: UtxoCoinConf,
+    /// Default decimals amount is 8 (BTC and almost all other UTXO coins)
+    /// But there are forks which have different decimals:
+    /// Peercoin has 6
+    /// Emercoin has 6
+    /// Bitcoin Diamond has 7
+    pub decimals: u8,
+    pub tx_fee: TxFee,
     /// Minimum transaction value at which the value is not less than fee
     pub dust_amount: u64,
-    /// Minimum number of confirmations at which a transaction is considered mature
-    pub mature_confirmations: u32,
+    /// RPC client
+    pub rpc_client: UtxoRpcClientEnum,
+    /// ECDSA key pair
+    pub key_pair: KeyPair,
+    /// Lock the mutex when we deal with address utxos
+    pub my_address: Address,
+    pub history_sync_state: Mutex<HistorySyncState>,
     /// Path to the TX cache directory
     pub tx_cache_directory: Option<PathBuf>,
     /// The cache of recently send transactions used to track the spent UTXOs and replace them with new outputs
     /// The daemon needs some time to update the listunspent list for address which makes it return already spent UTXOs
     /// This cache helps to prevent UTXO reuse in such cases
     pub recently_spent_outpoints: AsyncMutex<RecentlySpentOutPoints>,
+    pub tx_hash_algo: TxHashAlgo,
 }
 
-#[cfg_attr(test, mockable)]
 #[async_trait]
+#[cfg_attr(test, mockable)]
 pub trait UtxoCommonOps {
     async fn get_tx_fee(&self) -> Result<ActualTxFee, JsonRpcError>;
 
@@ -418,13 +462,14 @@ pub trait UtxoCommonOps {
         outputs: Vec<TransactionOutput>,
         script_data: Script,
         sequence: u32,
+        lock_time: u32,
     ) -> Result<UtxoTx, String>;
 
     /// Get transaction outputs available to spend.
-    fn ordered_mature_unspents(
-        &self,
+    async fn ordered_mature_unspents<'a>(
+        &'a self,
         address: &Address,
-    ) -> Box<dyn Future<Item = Vec<UnspentInfo>, Error = String> + Send>;
+    ) -> Result<(Vec<UnspentInfo>, AsyncMutexGuard<'a, RecentlySpentOutPoints>), String>;
 
     /// Try load verbose transaction from cache or try to request it from Rpc client.
     fn get_verbose_transaction_from_cache_or_rpc(
@@ -441,6 +486,18 @@ pub trait UtxoCommonOps {
         &self,
         address: &Address,
     ) -> Result<(Vec<UnspentInfo>, AsyncMutexGuard<'_, RecentlySpentOutPoints>), String>;
+
+    async fn preimage_trade_fee_required_to_send_outputs(
+        &self,
+        outputs: Vec<TransactionOutput>,
+        fee_policy: FeePolicy,
+        gas_fee: Option<u64>,
+        stage: &FeeApproxStage,
+    ) -> Result<BigDecimal, TradePreimageError>;
+
+    /// Increase the given `dynamic_fee` according to the fee approximation `stage`.
+    /// The method is used to predict a possible increase in dynamic fee.
+    fn increase_dynamic_fee_by_stage(&self, dynamic_fee: u64, stage: &FeeApproxStage) -> u64;
 }
 
 #[async_trait]
@@ -468,7 +525,21 @@ impl From<Arc<UtxoCoinFields>> for UtxoArc {
 
 impl UtxoArc {
     /// Returns weak reference to the inner UtxoCoinFields
-    fn downgrade(&self) -> Weak<UtxoCoinFields> { Arc::downgrade(&self.0) }
+    fn downgrade(&self) -> UtxoWeak {
+        let weak = Arc::downgrade(&self.0);
+        UtxoWeak(weak)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct UtxoWeak(Weak<UtxoCoinFields>);
+
+impl From<Weak<UtxoCoinFields>> for UtxoWeak {
+    fn from(weak: Weak<UtxoCoinFields>) -> Self { UtxoWeak(weak) }
+}
+
+impl UtxoWeak {
+    fn upgrade(&self) -> Option<UtxoArc> { self.0.upgrade().map(UtxoArc::from) }
 }
 
 // We can use a shared UTXO lock for all UTXO coins at 1 time.
@@ -546,7 +617,7 @@ pub struct UtxoFeeDetails {
     pub amount: BigDecimal,
 }
 
-#[cfg(feature = "native")]
+#[cfg(not(target_arch = "wasm32"))]
 // https://github.com/KomodoPlatform/komodo/blob/master/zcutil/fetch-params.sh#L5
 // https://github.com/KomodoPlatform/komodo/blob/master/zcutil/fetch-params.bat#L4
 pub fn zcash_params_path() -> PathBuf {
@@ -554,17 +625,17 @@ pub fn zcash_params_path() -> PathBuf {
         // >= Vista: c:\Users\$username\AppData\Roaming
         get_special_folder_path().join("ZcashParams")
     } else if cfg!(target_os = "macos") {
-        unwrap!(home_dir())
+        home_dir()
+            .unwrap()
             .join("Library")
             .join("Application Support")
             .join("ZcashParams")
     } else {
-        unwrap!(home_dir()).join(".zcash-params")
+        home_dir().unwrap().join(".zcash-params")
     }
 }
 
-#[cfg(feature = "native")]
-#[cfg(feature = "native")]
+#[cfg(not(target_arch = "wasm32"))]
 pub fn coin_daemon_data_dir(name: &str, is_asset_chain: bool) -> PathBuf {
     // komodo/util.cpp/GetDefaultDataDir
     let mut data_dir = match dirs::home_dir() {
@@ -600,57 +671,24 @@ pub fn coin_daemon_data_dir(name: &str, is_asset_chain: bool) -> PathBuf {
     data_dir
 }
 
-#[cfg(not(feature = "native"))]
-pub fn coin_daemon_data_dir(_name: &str, _is_asset_chain: bool) -> PathBuf { unimplemented!() }
-
-#[cfg(feature = "native")]
-/// Returns a path to the native coin wallet configuration.
-/// (This path is used in to read the wallet credentials).
-/// cf. https://github.com/artemii235/SuperNET/issues/346
-fn confpath(coins_en: &Json) -> Result<PathBuf, String> {
-    // Documented at https://github.com/jl777/coins#bitcoin-protocol-specific-json
-    // "USERHOME/" prefix should be replaced with the user's home folder.
-    let confpathˢ = coins_en["confpath"].as_str().unwrap_or("").trim();
-    if confpathˢ.is_empty() {
-        let (name, is_asset_chain) = {
-            match coins_en["asset"].as_str() {
-                Some(a) => (a, true),
-                None => (
-                    try_s!(coins_en["name"].as_str().ok_or("'name' field is not found in config")),
-                    false,
-                ),
-            }
-        };
-
-        let data_dir = coin_daemon_data_dir(name, is_asset_chain);
-
-        let confname = format!("{}.conf", name);
-
-        return Ok(data_dir.join(&confname[..]));
-    }
-    let (confpathˢ, rel_to_home) = match confpathˢ.strip_prefix("~/") {
-        Some(stripped) => (stripped, true),
-        None => match confpathˢ.strip_prefix("USERHOME/") {
-            Some(stripped) => (stripped, true),
-            None => (confpathˢ, false),
-        },
-    };
-
-    if rel_to_home {
-        let home = try_s!(home_dir().ok_or("Can not detect the user home directory"));
-        Ok(home.join(confpathˢ))
-    } else {
-        Ok(confpathˢ.into())
-    }
-}
-
-#[cfg(not(feature = "native"))]
-fn confpath(_coins_en: &Json) -> Result<PathBuf, String> { unimplemented!() }
-
 /// Attempts to parse native daemon conf file and return rpcport, rpcuser and rpcpassword
-#[cfg(feature = "native")]
-fn read_native_mode_conf(filename: &dyn AsRef<Path>) -> Result<(Option<u16>, String, String), String> {
+#[cfg(not(target_arch = "wasm32"))]
+fn read_native_mode_conf(
+    filename: &dyn AsRef<Path>,
+    network: &BlockchainNetwork,
+) -> Result<(Option<u16>, String, String), String> {
     use ini::Ini;
+
+    fn read_property<'a>(conf: &'a ini::Ini, network: &BlockchainNetwork, property: &str) -> Option<&'a String> {
+        let subsection = match network {
+            BlockchainNetwork::Mainnet => None,
+            BlockchainNetwork::Testnet => conf.section(Some("test")),
+            BlockchainNetwork::Regtest => conf.section(Some("regtest")),
+        };
+        subsection
+            .and_then(|props| props.get(property))
+            .or_else(|| conf.general_section().get(property))
+    }
 
     let conf: Ini = match Ini::load_from_file(&filename) {
         Ok(ini) => ini,
@@ -662,25 +700,19 @@ fn read_native_mode_conf(filename: &dyn AsRef<Path>) -> Result<(Option<u16>, Str
             )
         },
     };
-    let section = conf.general_section();
-    let rpc_port = match section.get("rpcport") {
+    let rpc_port = match read_property(&conf, network, "rpcport") {
         Some(port) => port.parse::<u16>().ok(),
         None => None,
     };
-    let rpc_user = try_s!(section.get("rpcuser").ok_or(ERRL!(
+    let rpc_user = try_s!(read_property(&conf, network, "rpcuser").ok_or(ERRL!(
         "Conf file {} doesn't have the rpcuser key",
         filename.as_ref().display()
     )));
-    let rpc_password = try_s!(section.get("rpcpassword").ok_or(ERRL!(
+    let rpc_password = try_s!(read_property(&conf, network, "rpcpassword").ok_or(ERRL!(
         "Conf file {} doesn't have the rpcpassword key",
         filename.as_ref().display()
     )));
     Ok((rpc_port, rpc_user.clone(), rpc_password.clone()))
-}
-
-#[cfg(not(feature = "native"))]
-fn read_native_mode_conf(_filename: &dyn AsRef<Path>) -> Result<(Option<u16>, String, String), String> {
-    unimplemented!()
 }
 
 /// Electrum protocol version verifier.
@@ -706,257 +738,475 @@ impl RpcTransportEventHandler for ElectrumProtoVerifier {
     }
 }
 
-pub async fn utxo_arc_from_conf_and_request(
-    ctx: &MmArc,
-    ticker: &str,
-    conf: &Json,
-    req: &Json,
-    priv_key: &[u8],
-    dust_amount: u64,
-) -> Result<UtxoArc, String> {
-    utxo_fields_from_conf_and_request(ctx, ticker, conf, req, priv_key, dust_amount)
-        .await
-        .map(|coin| UtxoArc(Arc::new(coin)))
+pub struct UtxoConfBuilder<'a> {
+    conf: &'a Json,
+    req: &'a Json,
+    ticker: &'a str,
 }
 
-pub async fn utxo_fields_from_conf_and_request(
-    ctx: &MmArc,
-    ticker: &str,
-    conf: &Json,
-    req: &Json,
-    priv_key: &[u8],
-    dust_amount: u64,
-) -> Result<UtxoCoinFields, String> {
-    let checksum_type = if ticker == "GRS" {
-        ChecksumType::DGROESTL512
-    } else if ticker == "SMART" {
-        ChecksumType::KECCAK256
-    } else {
-        ChecksumType::DSHA256
-    };
+impl<'a> UtxoConfBuilder<'a> {
+    pub fn new(conf: &'a Json, req: &'a Json, ticker: &'a str) -> Self { UtxoConfBuilder { conf, req, ticker } }
 
-    let pub_addr_prefix = conf["pubtype"].as_u64().unwrap_or(if ticker == "BTC" { 0 } else { 60 }) as u8;
-    let wif_prefix = conf["wiftype"]
-        .as_u64()
-        .unwrap_or(if ticker == "BTC" { 128 } else { 188 }) as u8;
+    pub fn build(&self) -> Result<UtxoCoinConf, String> {
+        let checksum_type = self.checksum_type();
+        let pub_addr_prefix = self.pub_addr_prefix();
+        let p2sh_addr_prefix = self.p2sh_address_prefix();
+        let pub_t_addr_prefix = self.pub_t_address_prefix();
+        let p2sh_t_addr_prefix = self.p2sh_t_address_prefix();
 
-    let private = Private {
-        prefix: wif_prefix,
-        secret: H256::from(priv_key),
-        compressed: true,
-        checksum_type,
-    };
+        let wif_prefix = self.wif_prefix();
 
-    let key_pair = try_s!(KeyPair::from_private(private));
-    let my_address = Address {
-        prefix: pub_addr_prefix,
-        t_addr_prefix: conf["taddr"].as_u64().unwrap_or(0) as u8,
-        hash: key_pair.public().address_hash(),
-        checksum_type,
-    };
+        let address_format = try_s!(self.address_format());
 
-    let address_format = if conf["address_format"].is_null() {
-        UtxoAddressFormat::Standard
-    } else {
-        try_s!(json::from_value(conf["address_format"].clone()))
-    };
+        let asset_chain = self.asset_chain();
+        let tx_version = self.tx_version();
+        let overwintered = self.overwintered();
 
-    let decimals = conf["decimals"].as_u64().unwrap_or(8) as u8;
+        let tx_fee_volatility_percent = self.tx_fee_volatility_percent();
+        let version_group_id = try_s!(self.version_group_id(tx_version, overwintered));
+        let consensus_branch_id = try_s!(self.consensus_branch_id(tx_version));
+        let signature_version = self.signature_version();
+        let fork_id = self.fork_id();
 
-    let rpc_client = match req["method"].as_str() {
-        Some("enable") => {
-            if cfg!(feature = "native") {
-                let native_conf_path = try_s!(confpath(conf));
-                let (rpc_port, rpc_user, rpc_password) = try_s!(read_native_mode_conf(&native_conf_path));
-                let auth_str = fomat!((rpc_user)":"(rpc_password));
-                let rpc_port = match rpc_port {
-                    Some(p) => p,
-                    None => try_s!(conf["rpcport"].as_u64().ok_or(ERRL!(
-                        "Rpc port is not set neither in `coins` file nor in native daemon config"
-                    ))) as u16,
-                };
-                let event_handlers =
-                    vec![
-                        CoinTransportMetrics::new(ctx.metrics.weak(), ticker.to_owned(), RpcClientType::Native)
-                            .into_shared(),
-                    ];
-                let client = Arc::new(NativeClientImpl {
-                    coin_ticker: ticker.to_string(),
-                    uri: fomat!("http://127.0.0.1:"(rpc_port)),
-                    auth: format!("Basic {}", base64_encode(&auth_str, URL_SAFE)),
-                    event_handlers,
-                    request_id: 0u64.into(),
-                    list_unspent_in_progress: false.into(),
-                    list_unspent_subs: AsyncMutex::new(Vec::new()),
-                    coin_decimals: decimals,
-                });
+        // should be sufficient to detect zcash by overwintered flag
+        let zcash = overwintered;
 
-                UtxoRpcClientEnum::Native(NativeClient(client))
-            } else {
-                return ERR!("Native UTXO mode is not available in non-native build");
-            }
-        },
-        Some("electrum") => {
-            let (on_connect_tx, on_connect_rx) = mpsc::unbounded();
-            let event_handlers = vec![
-                CoinTransportMetrics::new(ctx.metrics.weak(), ticker.to_owned(), RpcClientType::Electrum).into_shared(),
-                ElectrumProtoVerifier { on_connect_tx }.into_shared(),
-            ];
+        let required_confirmations = self.required_confirmations();
+        let requires_notarization = self.requires_notarization();
 
-            let mut servers: Vec<ElectrumRpcRequest> = try_s!(json::from_value(req["servers"].clone()));
-            let mut rng = small_rng();
-            servers.as_mut_slice().shuffle(&mut rng);
-            let client = ElectrumClientImpl::new(ticker.to_string(), event_handlers);
-            for server in servers.iter() {
-                match client.add_server(server).await {
-                    Ok(_) => (),
-                    Err(e) => log!("Error " (e) " connecting to " [server] ". Address won't be used"),
-                };
-            }
+        let mature_confirmations = self.mature_confirmations();
 
-            let mut attempts = 0i32;
-            while !client.is_connected().await {
-                if attempts >= 10 {
-                    return ERR!("Failed to connect to at least 1 of {:?} in 5 seconds.", servers);
-                }
+        let is_pos = self.is_pos();
+        let segwit = self.segwit();
+        let force_min_relay_fee = self.conf["force_min_relay_fee"].as_bool().unwrap_or(false);
+        let mtp_block_count = self.mtp_block_count();
+        let estimate_fee_mode = self.estimate_fee_mode();
+        let estimate_fee_blocks = self.estimate_fee_blocks();
 
-                Timer::sleep(0.5).await;
-                attempts += 1;
-            }
+        Ok(UtxoCoinConf {
+            ticker: self.ticker.to_owned(),
+            is_pos,
+            requires_notarization,
+            overwintered,
+            pub_addr_prefix,
+            p2sh_addr_prefix,
+            pub_t_addr_prefix,
+            p2sh_t_addr_prefix,
+            segwit,
+            wif_prefix,
+            tx_version,
+            address_format,
+            asset_chain,
+            tx_fee_volatility_percent,
+            version_group_id,
+            consensus_branch_id,
+            zcash,
+            checksum_type,
+            signature_version,
+            fork_id,
+            required_confirmations: required_confirmations.into(),
+            force_min_relay_fee,
+            mtp_block_count,
+            estimate_fee_mode,
+            mature_confirmations,
+            estimate_fee_blocks,
+        })
+    }
 
-            let client = Arc::new(client);
+    fn checksum_type(&self) -> ChecksumType {
+        match self.ticker {
+            "GRS" => ChecksumType::DGROESTL512,
+            "SMART" => ChecksumType::KECCAK256,
+            _ => ChecksumType::DSHA256,
+        }
+    }
 
-            let weak_client = Arc::downgrade(&client);
-            let client_name = format!("{} GUI/MM2 {}", ctx.gui().unwrap_or("UNKNOWN"), MM_VERSION);
-            spawn_electrum_version_loop(weak_client, on_connect_rx, client_name);
-
-            try_s!(wait_for_protocol_version_checked(&client).await);
-
-            let weak_client = Arc::downgrade(&client);
-            spawn_electrum_ping_loop(weak_client, servers);
-
-            UtxoRpcClientEnum::Electrum(ElectrumClient(client))
-        },
-        _ => return ERR!("utxo_arc_from_conf_and_request should be called only by enable or electrum requests"),
-    };
-    let asset_chain = conf["asset"].as_str().is_some();
-    let tx_version = conf["txversion"].as_i64().unwrap_or(1) as i32;
-    let overwintered = conf["overwintered"].as_u64().unwrap_or(0) == 1;
-
-    let tx_fee = match conf["txfee"].as_u64() {
-        None => TxFee::Fixed(1000),
-        Some(0) => {
-            let fee_method = match &rpc_client {
-                UtxoRpcClientEnum::Electrum(_) => EstimateFeeMethod::Standard,
-                UtxoRpcClientEnum::Native(client) => try_s!(client.detect_fee_method().compat().await),
-            };
-            TxFee::Dynamic(fee_method)
-        },
-        Some(fee) => TxFee::Fixed(fee),
-    };
-    let version_group_id = match conf["version_group_id"].as_str() {
-        Some(mut s) => {
-            if s.starts_with("0x") {
-                s = &s[2..];
-            }
-            let bytes = try_s!(hex::decode(s));
-            u32::from_be_bytes(try_s!(bytes.as_slice().try_into()))
-        },
-        None => {
-            if tx_version == 3 && overwintered {
-                0x03c4_8270
-            } else if tx_version == 4 && overwintered {
-                0x892f_2085
-            } else {
-                0
-            }
-        },
-    };
-
-    let consensus_branch_id = match conf["consensus_branch_id"].as_str() {
-        Some(mut s) => {
-            if s.starts_with("0x") {
-                s = &s[2..];
-            }
-            let bytes = try_s!(hex::decode(s));
-            u32::from_be_bytes(try_s!(bytes.as_slice().try_into()))
-        },
-        None => match tx_version {
-            3 => 0x5ba8_1b19,
-            4 => 0x76b8_09bb,
-            _ => 0,
-        },
-    };
-
-    let (signature_version, fork_id) = if ticker == "BCH" {
-        (SignatureVersion::ForkId, 0x40)
-    } else {
-        (SignatureVersion::Base, 0)
-    };
-    // should be sufficient to detect zcash by overwintered flag
-    let zcash = overwintered;
-
-    let initial_history_state = if req["tx_history"].as_bool().unwrap_or(false) {
-        HistorySyncState::NotStarted
-    } else {
-        HistorySyncState::NotEnabled
-    };
-
-    // param from request should override the config
-    let required_confirmations = req["required_confirmations"]
-        .as_u64()
-        .unwrap_or_else(|| conf["required_confirmations"].as_u64().unwrap_or(1));
-    let requires_notarization = req["requires_notarization"]
-        .as_bool()
-        .unwrap_or_else(|| conf["requires_notarization"].as_bool().unwrap_or(false))
-        .into();
-
-    let mature_confirmations = conf["mature_confirmations"]
-        .as_u64()
-        .map(|x| x as u32)
-        .unwrap_or(MATURE_CONFIRMATIONS_DEFAULT);
-    let tx_cache_directory = Some(ctx.dbdir().join("TX_CACHE"));
-
-    let my_script_pubkey = Builder::build_p2pkh(&my_address.hash).to_bytes();
-
-    let coin = UtxoCoinFields {
-        ticker: ticker.into(),
-        decimals,
-        rpc_client,
-        key_pair,
-        is_pos: conf["isPoS"].as_u64() == Some(1),
-        requires_notarization,
-        overwintered,
-        pub_addr_prefix,
-        p2sh_addr_prefix: conf["p2shtype"]
+    fn pub_addr_prefix(&self) -> u8 {
+        let pubtype = self.conf["pubtype"]
             .as_u64()
-            .unwrap_or(if ticker == "BTC" { 5 } else { 85 }) as u8,
-        pub_t_addr_prefix: conf["taddr"].as_u64().unwrap_or(0) as u8,
-        p2sh_t_addr_prefix: conf["taddr"].as_u64().unwrap_or(0) as u8,
-        segwit: conf["segwit"].as_bool().unwrap_or(false),
-        wif_prefix,
-        tx_version,
-        my_address,
-        address_format,
-        asset_chain,
-        tx_fee,
-        version_group_id,
-        consensus_branch_id,
-        zcash,
-        checksum_type,
-        signature_version,
-        fork_id,
-        history_sync_state: Mutex::new(initial_history_state),
-        required_confirmations: required_confirmations.into(),
-        force_min_relay_fee: conf["force_min_relay_fee"].as_bool().unwrap_or(false),
-        mtp_block_count: json::from_value(conf["mtp_block_count"].clone()).unwrap_or(KMD_MTP_BLOCK_COUNT),
-        estimate_fee_mode: json::from_value(conf["estimate_fee_mode"].clone()).unwrap_or(None),
-        dust_amount,
-        mature_confirmations,
-        tx_cache_directory,
-        recently_spent_outpoints: AsyncMutex::new(RecentlySpentOutPoints::new(my_script_pubkey)),
-    };
-    Ok(coin)
+            .unwrap_or(if self.ticker == "BTC" { 0 } else { 60 });
+        pubtype as u8
+    }
+
+    fn p2sh_address_prefix(&self) -> u8 {
+        self.conf["p2shtype"]
+            .as_u64()
+            .unwrap_or(if self.ticker == "BTC" { 5 } else { 85 }) as u8
+    }
+
+    fn pub_t_address_prefix(&self) -> u8 { self.conf["taddr"].as_u64().unwrap_or(0) as u8 }
+
+    fn p2sh_t_address_prefix(&self) -> u8 { self.conf["taddr"].as_u64().unwrap_or(0) as u8 }
+
+    fn wif_prefix(&self) -> u8 {
+        let wiftype = self.conf["wiftype"]
+            .as_u64()
+            .unwrap_or(if self.ticker == "BTC" { 128 } else { 188 });
+        wiftype as u8
+    }
+
+    fn address_format(&self) -> Result<UtxoAddressFormat, String> {
+        let conf = self.conf;
+        if conf["address_format"].is_null() {
+            Ok(UtxoAddressFormat::Standard)
+        } else {
+            json::from_value(self.conf["address_format"].clone()).map_err(|e| ERRL!("{}", e))
+        }
+    }
+
+    fn asset_chain(&self) -> bool { self.conf["asset"].as_str().is_some() }
+
+    fn tx_version(&self) -> i32 { self.conf["txversion"].as_i64().unwrap_or(1) as i32 }
+
+    fn overwintered(&self) -> bool { self.conf["overwintered"].as_u64().unwrap_or(0) == 1 }
+
+    fn tx_fee_volatility_percent(&self) -> f64 {
+        match self.conf["txfee_volatility_percent"].as_f64() {
+            Some(volatility) => volatility,
+            None => DEFAULT_DYNAMIC_FEE_VOLATILITY_PERCENT,
+        }
+    }
+
+    fn version_group_id(&self, tx_version: i32, overwintered: bool) -> Result<u32, String> {
+        let version_group_id = match self.conf["version_group_id"].as_str() {
+            Some(mut s) => {
+                if s.starts_with("0x") {
+                    s = &s[2..];
+                }
+                let bytes = try_s!(hex::decode(s));
+                u32::from_be_bytes(try_s!(bytes.as_slice().try_into()))
+            },
+            None => {
+                if tx_version == 3 && overwintered {
+                    0x03c4_8270
+                } else if tx_version == 4 && overwintered {
+                    0x892f_2085
+                } else {
+                    0
+                }
+            },
+        };
+        Ok(version_group_id)
+    }
+
+    fn consensus_branch_id(&self, tx_version: i32) -> Result<u32, String> {
+        let consensus_branch_id = match self.conf["consensus_branch_id"].as_str() {
+            Some(mut s) => {
+                if s.starts_with("0x") {
+                    s = &s[2..];
+                }
+                let bytes = try_s!(hex::decode(s));
+                u32::from_be_bytes(try_s!(bytes.as_slice().try_into()))
+            },
+            None => match tx_version {
+                3 => 0x5ba8_1b19,
+                4 => 0x76b8_09bb,
+                _ => 0,
+            },
+        };
+        Ok(consensus_branch_id)
+    }
+
+    fn signature_version(&self) -> SignatureVersion {
+        if self.ticker == "BCH" {
+            SignatureVersion::ForkId
+        } else {
+            SignatureVersion::Base
+        }
+    }
+
+    fn fork_id(&self) -> u32 {
+        if self.ticker == "BCH" {
+            0x40
+        } else {
+            0
+        }
+    }
+
+    fn required_confirmations(&self) -> u64 {
+        // param from request should override the config
+        self.req["required_confirmations"]
+            .as_u64()
+            .unwrap_or_else(|| self.conf["required_confirmations"].as_u64().unwrap_or(1))
+    }
+
+    fn requires_notarization(&self) -> AtomicBool {
+        self.req["requires_notarization"]
+            .as_bool()
+            .unwrap_or_else(|| self.conf["requires_notarization"].as_bool().unwrap_or(false))
+            .into()
+    }
+
+    fn mature_confirmations(&self) -> u32 {
+        self.conf["mature_confirmations"]
+            .as_u64()
+            .map(|x| x as u32)
+            .unwrap_or(MATURE_CONFIRMATIONS_DEFAULT)
+    }
+
+    fn is_pos(&self) -> bool { self.conf["isPoS"].as_u64() == Some(1) }
+
+    fn segwit(&self) -> bool { self.conf["segwit"].as_bool().unwrap_or(false) }
+
+    fn mtp_block_count(&self) -> NonZeroU64 {
+        json::from_value(self.conf["mtp_block_count"].clone()).unwrap_or(KMD_MTP_BLOCK_COUNT)
+    }
+
+    fn estimate_fee_mode(&self) -> Option<EstimateFeeMode> {
+        json::from_value(self.conf["estimate_fee_mode"].clone()).unwrap_or(None)
+    }
+
+    fn estimate_fee_blocks(&self) -> u32 { json::from_value(self.conf["estimate_fee_blocks"].clone()).unwrap_or(1) }
+}
+
+#[async_trait]
+pub trait UtxoCoinBuilder {
+    type ResultCoin;
+
+    async fn build(self) -> Result<Self::ResultCoin, String>;
+
+    fn ctx(&self) -> &MmArc;
+
+    fn conf(&self) -> &Json;
+
+    fn req(&self) -> &Json;
+
+    fn ticker(&self) -> &str;
+
+    fn priv_key(&self) -> &[u8];
+
+    async fn build_utxo_fields(&self) -> Result<UtxoCoinFields, String> {
+        let conf = try_s!(UtxoConfBuilder::new(self.conf(), self.req(), self.ticker()).build());
+
+        let private = Private {
+            prefix: conf.wif_prefix,
+            secret: H256::from(self.priv_key()),
+            compressed: true,
+            checksum_type: conf.checksum_type,
+        };
+        let key_pair = try_s!(KeyPair::from_private(private));
+        let my_address = Address {
+            prefix: conf.pub_addr_prefix,
+            t_addr_prefix: conf.pub_t_addr_prefix,
+            hash: key_pair.public().address_hash(),
+            checksum_type: conf.checksum_type,
+        };
+        let my_script_pubkey = Builder::build_p2pkh(&my_address.hash).to_bytes();
+        let rpc_client = try_s!(self.rpc_client().await);
+        let tx_fee = try_s!(self.tx_fee(&rpc_client).await);
+        let decimals = try_s!(self.decimals(&rpc_client).await);
+        let dust_amount = self.dust_amount();
+
+        let initial_history_state = self.initial_history_state();
+        let tx_cache_directory = Some(self.ctx().dbdir().join("TX_CACHE"));
+        let tx_hash_algo = self.tx_hash_algo();
+
+        let _my_script_pubkey = Builder::build_p2pkh(&my_address.hash).to_bytes();
+        let coin = UtxoCoinFields {
+            conf,
+            decimals,
+            dust_amount,
+            rpc_client,
+            key_pair,
+            my_address,
+            history_sync_state: Mutex::new(initial_history_state),
+            tx_cache_directory,
+            recently_spent_outpoints: AsyncMutex::new(RecentlySpentOutPoints::new(my_script_pubkey)),
+            tx_fee,
+            tx_hash_algo,
+        };
+        Ok(coin)
+    }
+
+    fn dust_amount(&self) -> u64 { json::from_value(self.conf()["dust"].clone()).unwrap_or(UTXO_DUST_AMOUNT) }
+
+    fn network(&self) -> Result<BlockchainNetwork, String> {
+        let conf = self.conf();
+        if !conf["network"].is_null() {
+            return json::from_value(conf["network"].clone()).map_err(|e| ERRL!("{}", e));
+        }
+        Ok(BlockchainNetwork::Mainnet)
+    }
+
+    async fn decimals(&self, _rpc_client: &UtxoRpcClientEnum) -> Result<u8, String> {
+        Ok(self.conf()["decimals"].as_u64().unwrap_or(8) as u8)
+    }
+
+    async fn tx_fee(&self, rpc_client: &UtxoRpcClientEnum) -> Result<TxFee, String> {
+        const ONE_DOGE: u64 = 100000000;
+
+        if self.ticker() == "DOGE" {
+            return Ok(TxFee::FixedPerKb(ONE_DOGE));
+        }
+
+        let tx_fee = match self.conf()["txfee"].as_u64() {
+            None => TxFee::Fixed(1000),
+            Some(0) => {
+                let fee_method = match &rpc_client {
+                    UtxoRpcClientEnum::Electrum(_) => EstimateFeeMethod::Standard,
+                    UtxoRpcClientEnum::Native(client) => try_s!(client.detect_fee_method().compat().await),
+                };
+                TxFee::Dynamic(fee_method)
+            },
+            Some(fee) => TxFee::Fixed(fee),
+        };
+        Ok(tx_fee)
+    }
+
+    fn initial_history_state(&self) -> HistorySyncState {
+        if self.req()["tx_history"].as_bool().unwrap_or(false) {
+            HistorySyncState::NotStarted
+        } else {
+            HistorySyncState::NotEnabled
+        }
+    }
+
+    async fn rpc_client(&self) -> Result<UtxoRpcClientEnum, String> {
+        match self.req()["method"].as_str() {
+            Some("enable") => {
+                #[cfg(target_arch = "wasm32")]
+                {
+                    ERR!("Native UTXO mode is only supported in native mode")
+                }
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    let native = try_s!(self.native_client());
+                    Ok(UtxoRpcClientEnum::Native(native))
+                }
+            },
+            Some("electrum") => {
+                let electrum = try_s!(self.electrum_client().await);
+                Ok(UtxoRpcClientEnum::Electrum(electrum))
+            },
+            _ => ERR!("Expected enable or electrum request"),
+        }
+    }
+
+    async fn electrum_client(&self) -> Result<ElectrumClient, String> {
+        let (on_connect_tx, on_connect_rx) = mpsc::unbounded();
+        let ticker = self.ticker().to_owned();
+        let ctx = self.ctx();
+        let event_handlers = vec![
+            CoinTransportMetrics::new(ctx.metrics.weak(), ticker.clone(), RpcClientType::Electrum).into_shared(),
+            ElectrumProtoVerifier { on_connect_tx }.into_shared(),
+        ];
+
+        let mut servers: Vec<ElectrumRpcRequest> = try_s!(json::from_value(self.req()["servers"].clone()));
+        let mut rng = small_rng();
+        servers.as_mut_slice().shuffle(&mut rng);
+        let client = ElectrumClientImpl::new(ticker, event_handlers);
+        for server in servers.iter() {
+            match client.add_server(server).await {
+                Ok(_) => (),
+                Err(e) => log!("Error " (e) " connecting to " [server] ". Address won't be used"),
+            };
+        }
+
+        let mut attempts = 0i32;
+        while !client.is_connected().await {
+            if attempts >= 10 {
+                return ERR!("Failed to connect to at least 1 of {:?} in 5 seconds.", servers);
+            }
+
+            Timer::sleep(0.5).await;
+            attempts += 1;
+        }
+
+        let client = Arc::new(client);
+
+        let weak_client = Arc::downgrade(&client);
+        let client_name = format!("{} GUI/MM2 {}", ctx.gui().unwrap_or("UNKNOWN"), MM_VERSION);
+        spawn_electrum_version_loop(weak_client, on_connect_rx, client_name);
+
+        try_s!(wait_for_protocol_version_checked(&client).await);
+
+        let weak_client = Arc::downgrade(&client);
+        spawn_electrum_ping_loop(weak_client, servers);
+
+        Ok(ElectrumClient(client))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn native_client(&self) -> Result<NativeClient, String> {
+        use base64::{encode_config as base64_encode, URL_SAFE};
+
+        let native_conf_path = try_s!(self.confpath());
+        let network = try_s!(self.network());
+        let (rpc_port, rpc_user, rpc_password) = try_s!(read_native_mode_conf(&native_conf_path, &network));
+        let auth_str = fomat!((rpc_user)":"(rpc_password));
+        let rpc_port = match rpc_port {
+            Some(p) => p,
+            None => try_s!(self.conf()["rpcport"].as_u64().ok_or(ERRL!(
+                "Rpc port is not set neither in `coins` file nor in native daemon config"
+            ))) as u16,
+        };
+
+        let ctx = self.ctx();
+        let coin_ticker = self.ticker().to_owned();
+        let event_handlers =
+            vec![
+                CoinTransportMetrics::new(ctx.metrics.weak(), coin_ticker.clone(), RpcClientType::Native).into_shared(),
+            ];
+        let client = Arc::new(NativeClientImpl {
+            coin_ticker,
+            uri: fomat!("http://127.0.0.1:"(rpc_port)),
+            auth: format!("Basic {}", base64_encode(&auth_str, URL_SAFE)),
+            event_handlers,
+            request_id: 0u64.into(),
+            list_unspent_in_progress: false.into(),
+            list_unspent_subs: AsyncMutex::new(Vec::new()),
+        });
+
+        Ok(NativeClient(client))
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn confpath(&self) -> Result<PathBuf, String> {
+        let conf = self.conf();
+        // Documented at https://github.com/jl777/coins#bitcoin-protocol-specific-json
+        // "USERHOME/" prefix should be replaced with the user's home folder.
+        let declared_confpath = match self.conf()["confpath"].as_str() {
+            Some(path) if !path.is_empty() => path.trim(),
+            _ => {
+                let (name, is_asset_chain) = {
+                    match conf["asset"].as_str() {
+                        Some(a) => (a, true),
+                        None => (
+                            try_s!(conf["name"].as_str().ok_or("'name' field is not found in config")),
+                            false,
+                        ),
+                    }
+                };
+                let data_dir = coin_daemon_data_dir(name, is_asset_chain);
+                let confname = format!("{}.conf", name);
+
+                return Ok(data_dir.join(&confname[..]));
+            },
+        };
+
+        let (confpath, rel_to_home) = match declared_confpath.strip_prefix("~/") {
+            Some(stripped) => (stripped, true),
+            None => match declared_confpath.strip_prefix("USERHOME/") {
+                Some(stripped) => (stripped, true),
+                None => (declared_confpath, false),
+            },
+        };
+
+        if rel_to_home {
+            let home = try_s!(home_dir().ok_or("Can not detect the user home directory"));
+            Ok(home.join(confpath))
+        } else {
+            Ok(confpath.into())
+        }
+    }
+
+    fn tx_hash_algo(&self) -> TxHashAlgo {
+        if self.ticker() == "GRS" {
+            TxHashAlgo::SHA256
+        } else {
+            TxHashAlgo::DSHA256
+        }
+    }
 }
 
 /// Ping the electrum servers every 30 seconds to prevent them from disconnecting us.
@@ -1188,12 +1438,13 @@ pub async fn kmd_rewards_info<T>(coin: &T) -> Result<Vec<KmdRewardsInfoElement>,
 where
     T: AsRef<UtxoCoinFields> + UtxoCommonOps,
 {
-    if coin.as_ref().ticker != "KMD" {
+    if coin.as_ref().conf.ticker != "KMD" {
         return ERR!("rewards info can be obtained for KMD only");
     }
 
-    let rpc_client = &coin.as_ref().rpc_client;
-    let mut unspents = try_s!(rpc_client.list_unspent(&coin.as_ref().my_address).compat().await);
+    let utxo = coin.as_ref();
+    let rpc_client = &utxo.rpc_client;
+    let mut unspents = try_s!(rpc_client.list_unspent(&utxo.my_address, utxo.decimals).compat().await);
     // list_unspent_ordered() returns ordered from lowest to highest by value unspent outputs.
     // reverse it to reorder from highest to lowest outputs.
     unspents.reverse();
@@ -1290,6 +1541,7 @@ pub(crate) fn sign_tx(
         join_split_pubkey: H256::default(),
         zcash: unsigned.zcash,
         str_d_zeel: unsigned.str_d_zeel,
+        tx_hash_algo: unsigned.hash_algo.into(),
     })
 }
 
@@ -1332,8 +1584,8 @@ where
         unsigned,
         &coin.as_ref().key_pair,
         prev_script,
-        coin.as_ref().signature_version,
-        coin.as_ref().fork_id
+        coin.as_ref().conf.signature_version,
+        coin.as_ref().conf.fork_id
     ));
 
     try_s!(
@@ -1406,4 +1658,20 @@ fn script_sig(message: &H256, key_pair: &KeyPair, fork_id: u32) -> Result<Bytes,
     sig_script.append(&mut Bytes::from(vec![1 | fork_id as u8]));
 
     Ok(sig_script)
+}
+
+pub fn address_by_conf_and_pubkey_str(coin: &str, conf: &Json, pubkey: &str) -> Result<String, String> {
+    let null = Json::Null;
+    let conf_builder = UtxoConfBuilder::new(&conf, &null, coin);
+    let utxo_conf = try_s!(conf_builder.build());
+    let pubkey_bytes = try_s!(hex::decode(pubkey));
+    let hash = dhash160(&pubkey_bytes);
+
+    let address = Address {
+        prefix: utxo_conf.pub_addr_prefix,
+        t_addr_prefix: utxo_conf.pub_t_addr_prefix,
+        hash,
+        checksum_type: utxo_conf.checksum_type,
+    };
+    display_address(&utxo_conf, &address)
 }

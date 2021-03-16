@@ -4,8 +4,8 @@
 #![feature(hash_raw_entry)]
 #![feature(integer_atomics)]
 #![feature(non_ascii_idents)]
-#![cfg_attr(not(feature = "native"), allow(unused_imports))]
 #![recursion_limit = "512"]
+#![cfg_attr(target_arch = "wasm32", allow(unused_imports))]
 
 #[macro_use] extern crate common;
 #[macro_use] extern crate enum_primitive_derive;
@@ -14,15 +14,15 @@
 #[macro_use] extern crate serde_json;
 #[macro_use] extern crate serde_derive;
 #[macro_use] extern crate serialization_derive;
-#[macro_use] extern crate unwrap;
 
 #[path = "mm2.rs"] mod mm2;
 
-#[cfg(feature = "native")] use crate::common::log::LOG_OUTPUT;
+#[cfg(not(target_arch = "wasm32"))]
+use crate::common::log::LOG_OUTPUT;
 use crate::common::mm_ctx::MmArc;
 use futures01::Future;
 use gstuff::{any_to_str, now_float};
-#[cfg(feature = "native")] use libc::c_char;
+#[cfg(not(target_arch = "wasm32"))] use libc::c_char;
 use num_traits::FromPrimitive;
 use serde_json::{self as json};
 use std::ffi::{CStr, CString};
@@ -45,7 +45,7 @@ enum MainErr {
 
 /// Starts the MM2 in a detached singleton thread.
 #[no_mangle]
-#[cfg(feature = "native")]
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe extern "C" fn mm2_main(conf: *const c_char, log_cb: extern "C" fn(line: *const c_char)) -> i8 {
     macro_rules! log {
@@ -74,11 +74,8 @@ pub unsafe extern "C" fn mm2_main(conf: *const c_char, log_cb: extern "C" fn(lin
     };
     let conf = conf.to_owned();
 
-    #[cfg(feature = "native")]
-    {
-        let mut log_output = LOG_OUTPUT.lock();
-        *log_output = Some(log_cb);
-    }
+    let mut log_output = LOG_OUTPUT.lock();
+    *log_output = Some(log_cb);
 
     let rc = thread::Builder::new().name("lp_main".into()).spawn(move || {
         if LP_MAIN_RUNNING.compare_and_swap(false, true, Ordering::Relaxed) {
@@ -99,10 +96,10 @@ pub unsafe extern "C" fn mm2_main(conf: *const c_char, log_cb: extern "C" fn(lin
     MainErr::Ok as i8
 }
 
-/// Checks if the MM2 singleton thread is currently running or not.  
-/// 0 .. not running.  
-/// 1 .. running, but no context yet.  
-/// 2 .. context, but no RPC yet.  
+/// Checks if the MM2 singleton thread is currently running or not.
+/// 0 .. not running.
+/// 1 .. running, but no context yet.
+/// 2 .. context, but no RPC yet.
 /// 3 .. RPC is up.
 #[no_mangle]
 pub extern "C" fn mm2_main_status() -> i8 {
@@ -127,12 +124,9 @@ pub extern "C" fn mm2_main_status() -> i8 {
 }
 
 #[no_mangle]
-#[cfg(feature = "native")]
+#[cfg(not(target_arch = "wasm32"))]
 pub extern "C" fn mm2_test(torch: i32, log_cb: extern "C" fn(line: *const c_char)) -> i32 {
-    #[cfg(feature = "native")]
-    {
-        *LOG_OUTPUT.lock() = Some(log_cb);
-    }
+    *LOG_OUTPUT.lock() = Some(log_cb);
 
     static RUNNING: AtomicBool = AtomicBool::new(false);
     if RUNNING.compare_and_swap(false, true, Ordering::Relaxed) {
@@ -151,7 +145,7 @@ pub extern "C" fn mm2_test(torch: i32, log_cb: extern "C" fn(line: *const c_char
                 return -1;
             },
         };
-        let conf = unwrap!(json::to_string(&ctx.conf));
+        let conf = json::to_string(&ctx.conf).unwrap();
         let hy_res = mm2::rpc::lp_commands::stop(ctx);
         let r = match hy_res.wait() {
             Ok(r) => r,
@@ -203,9 +197,9 @@ pub extern "C" fn mm2_test(torch: i32, log_cb: extern "C" fn(line: *const c_char
     // #402: Restart the MM.
     if let Some((prev_ctx_id, conf)) = prev {
         log!("mm2_test] Restarting MM…");
-        let conf = unwrap!(CString::new(&conf[..]));
+        let conf = CString::new(&conf[..]).unwrap();
         let rc = unsafe { mm2_main(conf.as_ptr(), log_cb) };
-        let rc = unwrap!(MainErr::from_i8(rc));
+        let rc = MainErr::from_i8(rc).unwrap();
         if rc != MainErr::Ok {
             log!("!mm2_main: "[rc]);
             return -1;

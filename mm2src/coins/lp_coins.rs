@@ -29,23 +29,25 @@
 #[macro_use] extern crate lazy_static;
 #[macro_use] extern crate serde_derive;
 #[macro_use] extern crate serde_json;
-#[macro_use] extern crate unwrap;
 
 use async_trait::async_trait;
 use bigdecimal::BigDecimal;
 use common::executor::{spawn, Timer};
 use common::mm_ctx::{from_ctx, MmArc};
 use common::mm_metrics::MetricsWeak;
-use common::{block_on, rpc_err_response, rpc_response, HyRes};
+use common::mm_number::MmNumber;
+use common::{block_on, calc_total_pages, now_ms, rpc_err_response, rpc_response, HyRes, TraceSource, Traceable};
 use futures::compat::Future01CompatExt;
 use futures::lock::Mutex as AsyncMutex;
 use futures01::Future;
 use gstuff::slurp;
 use http::Response;
 use rpc::v1::types::Bytes as BytesJson;
+use serde::{Deserialize, Deserializer};
 use serde_json::{self as json, Value as Json};
 use std::collections::hash_map::{HashMap, RawEntryMut};
 use std::fmt;
+use std::num::NonZeroUsize;
 use std::ops::Deref;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -68,15 +70,15 @@ pub mod coins_tests;
 pub mod eth;
 use self::eth::{eth_coin_from_conf_and_request, EthCoin, EthTxFeeDetails, SignedEthTx};
 pub mod utxo;
+use self::utxo::qtum::{self, qtum_coin_from_conf_and_request, QtumCoin};
 use self::utxo::utxo_standard::{utxo_standard_coin_from_conf_and_request, UtxoStandardCoin};
-use self::utxo::{UtxoFeeDetails, UtxoTx};
+use self::utxo::{GenerateTransactionError, UtxoFeeDetails, UtxoTx};
 pub mod qrc20;
-use qrc20::{qrc20_addr_from_str, qrc20_coin_from_conf_and_request, Qrc20Coin, Qrc20FeeDetails};
+use qrc20::{qrc20_coin_from_conf_and_request, Qrc20Coin, Qrc20FeeDetails};
 #[doc(hidden)]
 #[allow(unused_variables)]
 pub mod test_coin;
-pub use self::test_coin::TestCoin;
-use common::mm_number::MmNumber;
+pub use test_coin::TestCoin;
 
 pub trait Transaction: fmt::Debug + 'static {
     /// Raw transaction bytes of the transaction
@@ -112,6 +114,12 @@ pub enum FoundSwapTxSpend {
     Refunded(TransactionEnum),
 }
 
+pub enum CanRefundHtlc {
+    CanRefundNow,
+    // returns the number of seconds to sleep before HTLC becomes refundable
+    HaveToWait(u64),
+}
+
 /// Swap operations (mostly based on the Hash/Time locked transactions implemented by coin wallets).
 pub trait SwapOps {
     fn send_taker_fee(&self, fee_addr: &[u8], amount: BigDecimal) -> TransactionFut;
@@ -122,6 +130,7 @@ pub trait SwapOps {
         taker_pub: &[u8],
         secret_hash: &[u8],
         amount: BigDecimal,
+        swap_contract_address: &Option<BytesJson>,
     ) -> TransactionFut;
 
     fn send_taker_payment(
@@ -130,6 +139,7 @@ pub trait SwapOps {
         maker_pub: &[u8],
         secret_hash: &[u8],
         amount: BigDecimal,
+        swap_contract_address: &Option<BytesJson>,
     ) -> TransactionFut;
 
     fn send_maker_spends_taker_payment(
@@ -138,6 +148,7 @@ pub trait SwapOps {
         time_lock: u32,
         taker_pub: &[u8],
         secret: &[u8],
+        swap_contract_address: &Option<BytesJson>,
     ) -> TransactionFut;
 
     fn send_taker_spends_maker_payment(
@@ -146,6 +157,7 @@ pub trait SwapOps {
         time_lock: u32,
         maker_pub: &[u8],
         secret: &[u8],
+        swap_contract_address: &Option<BytesJson>,
     ) -> TransactionFut;
 
     fn send_taker_refunds_payment(
@@ -154,6 +166,7 @@ pub trait SwapOps {
         time_lock: u32,
         maker_pub: &[u8],
         secret_hash: &[u8],
+        swap_contract_address: &Option<BytesJson>,
     ) -> TransactionFut;
 
     fn send_maker_refunds_payment(
@@ -162,13 +175,16 @@ pub trait SwapOps {
         time_lock: u32,
         taker_pub: &[u8],
         secret_hash: &[u8],
+        swap_contract_address: &Option<BytesJson>,
     ) -> TransactionFut;
 
     fn validate_fee(
         &self,
         fee_tx: &TransactionEnum,
+        expected_sender: &[u8],
         fee_addr: &[u8],
         amount: &BigDecimal,
+        min_block_number: u64,
     ) -> Box<dyn Future<Item = (), Error = String> + Send>;
 
     fn validate_maker_payment(
@@ -178,6 +194,7 @@ pub trait SwapOps {
         maker_pub: &[u8],
         priv_bn_hash: &[u8],
         amount: BigDecimal,
+        swap_contract_address: &Option<BytesJson>,
     ) -> Box<dyn Future<Item = (), Error = String> + Send>;
 
     fn validate_taker_payment(
@@ -187,6 +204,7 @@ pub trait SwapOps {
         taker_pub: &[u8],
         priv_bn_hash: &[u8],
         amount: BigDecimal,
+        swap_contract_address: &Option<BytesJson>,
     ) -> Box<dyn Future<Item = (), Error = String> + Send>;
 
     fn check_if_my_payment_sent(
@@ -195,6 +213,7 @@ pub trait SwapOps {
         other_pub: &[u8],
         secret_hash: &[u8],
         search_from_block: u64,
+        swap_contract_address: &Option<BytesJson>,
     ) -> Box<dyn Future<Item = Option<TransactionEnum>, Error = String> + Send>;
 
     fn search_for_swap_tx_spend_my(
@@ -204,6 +223,7 @@ pub trait SwapOps {
         secret_hash: &[u8],
         tx: &[u8],
         search_from_block: u64,
+        swap_contract_address: &Option<BytesJson>,
     ) -> Result<Option<FoundSwapTxSpend>, String>;
 
     fn search_for_swap_tx_spend_other(
@@ -213,9 +233,23 @@ pub trait SwapOps {
         secret_hash: &[u8],
         tx: &[u8],
         search_from_block: u64,
+        swap_contract_address: &Option<BytesJson>,
     ) -> Result<Option<FoundSwapTxSpend>, String>;
 
     fn extract_secret(&self, secret_hash: &[u8], spend_tx: &[u8]) -> Result<Vec<u8>, String>;
+
+    /// Whether the refund transaction can be sent now
+    /// For example: there are no additional conditions for ETH, but for some UTXO coins we should wait for
+    /// locktime < MTP
+    fn can_refund_htlc(&self, locktime: u64) -> Box<dyn Future<Item = CanRefundHtlc, Error = String> + Send + '_> {
+        let now = now_ms() / 1000;
+        let result = if now > locktime {
+            CanRefundHtlc::CanRefundNow
+        } else {
+            CanRefundHtlc::HaveToWait(locktime - now + 1)
+        };
+        Box::new(futures01::future::ok(result))
+    }
 }
 
 /// Operations that coins have independently from the MarketMaker.
@@ -225,7 +259,11 @@ pub trait MarketCoinOps {
 
     fn my_address(&self) -> Result<String, String>;
 
-    fn my_balance(&self) -> Box<dyn Future<Item = BigDecimal, Error = String> + Send>;
+    fn my_balance(&self) -> Box<dyn Future<Item = CoinBalance, Error = String> + Send>;
+
+    fn my_spendable_balance(&self) -> Box<dyn Future<Item = BigDecimal, Error = String> + Send> {
+        Box::new(self.my_balance().map(|CoinBalance { spendable, .. }| spendable))
+    }
 
     /// Base coin balance for tokens, e.g. ETH balance in ERC20 case
     fn base_coin_balance(&self) -> Box<dyn Future<Item = BigDecimal, Error = String> + Send>;
@@ -242,7 +280,13 @@ pub trait MarketCoinOps {
         check_every: u64,
     ) -> Box<dyn Future<Item = (), Error = String> + Send>;
 
-    fn wait_for_tx_spend(&self, transaction: &[u8], wait_until: u64, from_block: u64) -> TransactionFut;
+    fn wait_for_tx_spend(
+        &self,
+        transaction: &[u8],
+        wait_until: u64,
+        from_block: u64,
+        swap_contract_address: &Option<BytesJson>,
+    ) -> TransactionFut;
 
     fn tx_enum_from_bytes(&self, bytes: &[u8]) -> Result<TransactionEnum, String>;
 
@@ -251,6 +295,9 @@ pub trait MarketCoinOps {
     fn address_from_pubkey_str(&self, pubkey: &str) -> Result<String, String>;
 
     fn display_priv_key(&self) -> String;
+
+    /// Get the minimum amount to send.
+    fn min_tx_amount(&self) -> BigDecimal;
 }
 
 #[derive(Deserialize)]
@@ -286,12 +333,36 @@ pub struct WithdrawRequest {
     fee: Option<WithdrawFee>,
 }
 
-#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
-#[serde(untagged)]
+/// Please note that no type should have the same structure as another type,
+/// because this enum has the `untagged` deserialization.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+#[serde(tag = "type")]
 pub enum TxFeeDetails {
     Utxo(UtxoFeeDetails),
     Eth(EthTxFeeDetails),
     Qrc20(Qrc20FeeDetails),
+}
+
+/// Deserialize the TxFeeDetails as an untagged enum.
+impl<'de> Deserialize<'de> for TxFeeDetails {
+    fn deserialize<D>(deserializer: D) -> Result<Self, <D as Deserializer<'de>>::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(untagged)]
+        enum TxFeeDetailsUnTagged {
+            Utxo(UtxoFeeDetails),
+            Eth(EthTxFeeDetails),
+            Qrc20(Qrc20FeeDetails),
+        }
+
+        match Deserialize::deserialize(deserializer)? {
+            TxFeeDetailsUnTagged::Utxo(f) => Ok(TxFeeDetails::Utxo(f)),
+            TxFeeDetailsUnTagged::Eth(f) => Ok(TxFeeDetails::Eth(f)),
+            TxFeeDetailsUnTagged::Qrc20(f) => Ok(TxFeeDetails::Qrc20(f)),
+        }
+    }
 }
 
 impl Into<TxFeeDetails> for EthTxFeeDetails {
@@ -355,17 +426,76 @@ impl TransactionDetails {
     }
 }
 
-pub enum TradeInfo {
-    // going to act as maker
-    Maker,
-    // going to act as taker with expected dexfee amount
-    Taker(BigDecimal),
-}
-
-#[derive(Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct TradeFee {
     pub coin: String,
     pub amount: MmNumber,
+}
+
+#[derive(Clone, Debug, PartialEq, PartialOrd)]
+pub struct CoinBalance {
+    pub spendable: BigDecimal,
+    pub unspendable: BigDecimal,
+}
+
+/// The approximation is needed to cover the dynamic miner fee changing during a swap.
+#[derive(Clone, Debug)]
+pub enum FeeApproxStage {
+    /// Do not increase the trade fee.
+    WithoutApprox,
+    /// Increase the trade fee slightly.
+    StartSwap,
+    /// Increase the trade fee significantly.
+    OrderIssue,
+    /// Increase the trade fee largely.
+    TradePreimage,
+}
+
+#[derive(Debug)]
+pub enum TradePreimageValue {
+    Exact(BigDecimal),
+    UpperBound(BigDecimal),
+}
+
+#[derive(Debug)]
+pub enum TradePreimageError {
+    NotSufficientBalance(String),
+    Other(String),
+}
+
+impl fmt::Display for TradePreimageError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TradePreimageError::NotSufficientBalance(e) => write!(f, "Not sufficient balance: {}", e),
+            TradePreimageError::Other(e) => write!(f, "{}", e),
+        }
+    }
+}
+
+impl Traceable for TradePreimageError {
+    fn trace(self, source: TraceSource) -> Self {
+        match self {
+            TradePreimageError::NotSufficientBalance(e) => {
+                TradePreimageError::NotSufficientBalance(source.with_msg(&e))
+            },
+            TradePreimageError::Other(e) => TradePreimageError::Other(source.with_msg(&e)),
+        }
+    }
+}
+
+impl From<GenerateTransactionError> for TradePreimageError {
+    fn from(e: GenerateTransactionError) -> Self {
+        match e {
+            GenerateTransactionError::EmptyUtxoSet => {
+                TradePreimageError::NotSufficientBalance(GenerateTransactionError::EmptyUtxoSet.to_string())
+            },
+            GenerateTransactionError::NotSufficientBalance { description }
+            | GenerateTransactionError::DeductFeeFromOutputFailed { description } => {
+                TradePreimageError::NotSufficientBalance(description)
+            },
+            e => TradePreimageError::Other(e.to_string()),
+        }
+    }
 }
 
 /// NB: Implementations are expected to follow the pImpl idiom, providing cheap reference-counted cloning and garbage collection.
@@ -377,8 +507,6 @@ pub trait MmCoin: SwapOps + MarketCoinOps + fmt::Debug + Send + Sync + 'static {
     // status/availability check: https://github.com/artemii235/SuperNET/issues/156#issuecomment-446501816
 
     fn is_asset_chain(&self) -> bool;
-
-    fn can_i_spend_other_payment(&self) -> Box<dyn Future<Item = (), Error = String> + Send>;
 
     /// The coin can be initialized, but it cannot participate in the swaps.
     fn wallet_only(&self) -> bool;
@@ -422,7 +550,7 @@ pub trait MmCoin: SwapOps + MarketCoinOps + fmt::Debug + Send + Sync + 'static {
                         &[&"tx_history", &self.ticker().to_string()],
                         &ERRL!("Error {} on history deserialization, resetting the cache.", e),
                     );
-                    unwrap!(std::fs::remove_file(&self.tx_history_path(&ctx)));
+                    std::fs::remove_file(&self.tx_history_path(&ctx)).unwrap();
                     vec![]
                 },
             }
@@ -446,6 +574,26 @@ pub trait MmCoin: SwapOps + MarketCoinOps + fmt::Debug + Send + Sync + 'static {
     /// Get fee to be paid per 1 swap transaction
     fn get_trade_fee(&self) -> Box<dyn Future<Item = TradeFee, Error = String> + Send>;
 
+    /// Get fee to be paid by sender per whole swap using the sending value and check if the wallet has sufficient balance to pay the fee.
+    fn get_sender_trade_fee(
+        &self,
+        value: TradePreimageValue,
+        stage: FeeApproxStage,
+    ) -> Box<dyn Future<Item = TradeFee, Error = TradePreimageError> + Send>;
+
+    /// Get fee to be paid by receiver per whole swap and check if the wallet has sufficient balance to pay the fee.
+    fn get_receiver_trade_fee(
+        &self,
+        stage: FeeApproxStage,
+    ) -> Box<dyn Future<Item = TradeFee, Error = TradePreimageError> + Send>;
+
+    /// Get transaction fee the Taker has to pay to send a `TakerFee` transaction and check if the wallet has sufficient balance to pay the fee.
+    fn get_fee_to_send_taker_fee(
+        &self,
+        dex_fee_amount: BigDecimal,
+        stage: FeeApproxStage,
+    ) -> Box<dyn Future<Item = TradeFee, Error = TradePreimageError> + Send>;
+
     /// required transaction confirmations number to ensure double-spend safety
     fn required_confirmations(&self) -> u64;
 
@@ -458,13 +606,17 @@ pub trait MmCoin: SwapOps + MarketCoinOps + fmt::Debug + Send + Sync + 'static {
     /// set requires notarization
     fn set_requires_notarization(&self, requires_nota: bool);
 
-    /// Get unspendable balance (sum of non-mature output values).
-    fn my_unspendable_balance(&self) -> Box<dyn Future<Item = BigDecimal, Error = String> + Send>;
+    /// Get swap contract address if the coin uses it in Atomic Swaps.
+    fn swap_contract_address(&self) -> Option<BytesJson>;
+
+    /// The minimum number of confirmations at which a transaction is considered mature.
+    fn mature_confirmations(&self) -> Option<u32>;
 }
 
 #[derive(Clone, Debug)]
 pub enum MmCoinEnum {
     UtxoCoin(UtxoStandardCoin),
+    QtumCoin(QtumCoin),
     Qrc20Coin(Qrc20Coin),
     EthCoin(EthCoin),
     Test(TestCoin),
@@ -482,6 +634,10 @@ impl From<TestCoin> for MmCoinEnum {
     fn from(c: TestCoin) -> MmCoinEnum { MmCoinEnum::Test(c) }
 }
 
+impl From<QtumCoin> for MmCoinEnum {
+    fn from(coin: QtumCoin) -> Self { MmCoinEnum::QtumCoin(coin) }
+}
+
 impl From<Qrc20Coin> for MmCoinEnum {
     fn from(c: Qrc20Coin) -> MmCoinEnum { MmCoinEnum::Qrc20Coin(c) }
 }
@@ -492,6 +648,7 @@ impl Deref for MmCoinEnum {
     fn deref(&self) -> &dyn MmCoin {
         match self {
             MmCoinEnum::UtxoCoin(ref c) => c,
+            MmCoinEnum::QtumCoin(ref c) => c,
             MmCoinEnum::Qrc20Coin(ref c) => c,
             MmCoinEnum::EthCoin(ref c) => c,
             MmCoinEnum::Test(ref c) => c,
@@ -501,7 +658,7 @@ impl Deref for MmCoinEnum {
 
 #[async_trait]
 pub trait BalanceTradeFeeUpdatedHandler {
-    async fn balance_updated(&self, ticker: &str, new_balance: &BigDecimal, trade_fee: &TradeFee);
+    async fn balance_updated(&self, coin: &MmCoinEnum, new_balance: &BigDecimal);
 }
 
 struct CoinsContext {
@@ -526,6 +683,7 @@ impl CoinsContext {
 #[serde(tag = "type", content = "protocol_data")]
 pub enum CoinProtocol {
     UTXO,
+    QTUM,
     QRC20 { platform: String, contract_address: String },
     ETH,
     ERC20 { platform: String, contract_address: String },
@@ -648,10 +806,21 @@ impl RpcTransportEventHandler for CoinTransportMetrics {
 
 #[async_trait]
 impl BalanceTradeFeeUpdatedHandler for CoinsContext {
-    async fn balance_updated(&self, ticker: &str, new_balance: &BigDecimal, trade_fee: &TradeFee) {
+    async fn balance_updated(&self, coin: &MmCoinEnum, new_balance: &BigDecimal) {
         for sub in self.balance_update_handlers.lock().await.iter() {
-            sub.balance_updated(ticker, new_balance, trade_fee).await
+            sub.balance_updated(coin, new_balance).await
         }
+    }
+}
+
+pub fn coin_conf(ctx: &MmArc, ticker: &str) -> Json {
+    match ctx.conf["coins"].as_array() {
+        Some(coins) => coins
+            .iter()
+            .find(|coin| coin["coin"].as_str() == Some(ticker))
+            .cloned()
+            .unwrap_or(Json::Null),
+        None => Json::Null,
     }
 }
 
@@ -671,14 +840,7 @@ pub async fn lp_coininit(ctx: &MmArc, ticker: &str, req: &Json) -> Result<MmCoin
         }
     }
 
-    let coins_en = if let Some(coins) = ctx.conf["coins"].as_array() {
-        coins
-            .iter()
-            .find(|coin| coin["coin"].as_str() == Some(ticker))
-            .unwrap_or(&Json::Null)
-    } else {
-        &Json::Null
-    };
+    let coins_en = coin_conf(ctx, ticker);
 
     if coins_en.is_null() {
         ctx.log.log(
@@ -706,18 +868,20 @@ pub async fn lp_coininit(ctx: &MmArc, ticker: &str, req: &Json) -> Result<MmCoin
 
     let coin: MmCoinEnum = match &protocol {
         CoinProtocol::UTXO => {
-            try_s!(utxo_standard_coin_from_conf_and_request(ctx, ticker, coins_en, req, secret).await).into()
+            try_s!(utxo_standard_coin_from_conf_and_request(ctx, ticker, &coins_en, req, secret).await).into()
         },
+        CoinProtocol::QTUM => try_s!(qtum_coin_from_conf_and_request(ctx, ticker, &coins_en, req, secret).await).into(),
         CoinProtocol::ETH | CoinProtocol::ERC20 { .. } => {
-            try_s!(eth_coin_from_conf_and_request(ctx, ticker, coins_en, req, secret, protocol).await).into()
+            try_s!(eth_coin_from_conf_and_request(ctx, ticker, &coins_en, req, secret, protocol).await).into()
         },
         CoinProtocol::QRC20 {
             platform,
             contract_address,
         } => {
-            let contract_address = try_s!(qrc20_addr_from_str(&contract_address));
+            let contract_address = try_s!(qtum::contract_addr_from_str(&contract_address));
             try_s!(
-                qrc20_coin_from_conf_and_request(ctx, ticker, &platform, coins_en, req, secret, contract_address).await
+                qrc20_coin_from_conf_and_request(ctx, ticker, &platform, &coins_en, req, secret, contract_address)
+                    .await
             )
             .into()
         },
@@ -736,7 +900,7 @@ pub async fn lp_coininit(ctx: &MmArc, ticker: &str, req: &Json) -> Result<MmCoin
         RawEntryMut::Vacant(ve) => ve.insert(ticker.to_string(), coin.clone()),
     };
     let history = req["tx_history"].as_bool().unwrap_or(false);
-    #[cfg(not(feature = "native"))]
+    #[cfg(target_arch = "wasm32")]
     let history = {
         if history {
             ctx.log.log(
@@ -761,14 +925,7 @@ pub async fn lp_coininit(ctx: &MmArc, ticker: &str, req: &Json) -> Result<MmCoin
 }
 
 /// NB: Returns only the enabled (aka active) coins.
-pub fn lp_coinfind(ctx: &MmArc, ticker: &str) -> Result<Option<MmCoinEnum>, String> {
-    let cctx = try_s!(CoinsContext::from_ctx(ctx));
-    let coins = block_on(cctx.coins.lock());
-    Ok(coins.get(ticker).cloned())
-}
-
-/// NB: Returns only the enabled (aka active) coins.
-pub async fn lp_coinfindᵃ(ctx: &MmArc, ticker: &str) -> Result<Option<MmCoinEnum>, String> {
+pub async fn lp_coinfind(ctx: &MmArc, ticker: &str) -> Result<Option<MmCoinEnum>, String> {
     let cctx = try_s!(CoinsContext::from_ctx(ctx));
     let coins = cctx.coins.lock().await;
     Ok(coins.get(ticker).cloned())
@@ -784,7 +941,7 @@ struct ConvertAddressReq {
 
 pub async fn convert_address(ctx: MmArc, req: Json) -> Result<Response<Vec<u8>>, String> {
     let req: ConvertAddressReq = try_s!(json::from_value(req));
-    let coin = match lp_coinfindᵃ(&ctx, &req.coin).await {
+    let coin = match lp_coinfind(&ctx, &req.coin).await {
         Ok(Some(t)) => t,
         Ok(None) => return ERR!("No such coin: {}", req.coin),
         Err(err) => return ERR!("!lp_coinfind({}): {}", req.coin, err),
@@ -799,8 +956,7 @@ pub async fn convert_address(ctx: MmArc, req: Json) -> Result<Response<Vec<u8>>,
 }
 
 pub async fn kmd_rewards_info(ctx: MmArc) -> Result<Response<Vec<u8>>, String> {
-    let coin = match lp_coinfindᵃ(&ctx, "KMD").await {
-        // Use lp_coinfindᵃ when async.
+    let coin = match lp_coinfind(&ctx, "KMD").await {
         Ok(Some(MmCoinEnum::UtxoCoin(t))) => t,
         Ok(Some(_)) => return ERR!("KMD was expected to be UTXO"),
         Ok(None) => return ERR!("KMD is not activated"),
@@ -829,7 +985,7 @@ pub struct ValidateAddressResult {
 
 pub async fn validate_address(ctx: MmArc, req: Json) -> Result<Response<Vec<u8>>, String> {
     let req: ValidateAddressReq = try_s!(json::from_value(req));
-    let coin = match lp_coinfindᵃ(&ctx, &req.coin).await {
+    let coin = match lp_coinfind(&ctx, &req.coin).await {
         Ok(Some(t)) => t,
         Ok(None) => return ERR!("No such coin: {}", req.coin),
         Err(err) => return ERR!("!lp_coinfind({}): {}", req.coin, err),
@@ -842,7 +998,7 @@ pub async fn validate_address(ctx: MmArc, req: Json) -> Result<Response<Vec<u8>>
 
 pub async fn withdraw(ctx: MmArc, req: Json) -> Result<Response<Vec<u8>>, String> {
     let ticker = try_s!(req["coin"].as_str().ok_or("No 'coin' field")).to_owned();
-    let coin = match lp_coinfindᵃ(&ctx, &ticker).await {
+    let coin = match lp_coinfind(&ctx, &ticker).await {
         Ok(Some(t)) => t,
         Ok(None) => return ERR!("No such coin: {}", ticker),
         Err(err) => return ERR!("!lp_coinfind({}): {}", ticker, err),
@@ -855,7 +1011,7 @@ pub async fn withdraw(ctx: MmArc, req: Json) -> Result<Response<Vec<u8>>, String
 
 pub async fn send_raw_transaction(ctx: MmArc, req: Json) -> Result<Response<Vec<u8>>, String> {
     let ticker = try_s!(req["coin"].as_str().ok_or("No 'coin' field")).to_owned();
-    let coin = match lp_coinfindᵃ(&ctx, &ticker).await {
+    let coin = match lp_coinfind(&ctx, &ticker).await {
         Ok(Some(t)) => t,
         Ok(None) => return ERR!("No such coin: {}", ticker),
         Err(err) => return ERR!("!lp_coinfind({}): {}", ticker, err),
@@ -886,6 +1042,7 @@ struct MyTxHistoryRequest {
     max: bool,
     #[serde(default = "ten")]
     limit: usize,
+    page_number: Option<NonZeroUsize>,
 }
 
 /// Returns the transaction history of selected coin. Returns no more than `limit` records (default: 10).
@@ -893,8 +1050,8 @@ struct MyTxHistoryRequest {
 /// Transactions are sorted by number of confirmations in ascending order.
 pub fn my_tx_history(ctx: MmArc, req: Json) -> HyRes {
     let request: MyTxHistoryRequest = try_h!(json::from_value(req));
-    let coin = match lp_coinfind(&ctx, &request.coin) {
-        // Should switch to lp_coinfindᵃ when my_tx_history is async.
+    // Should remove `block_on` when my_tx_history is async.
+    let coin = match block_on(lp_coinfind(&ctx, &request.coin)) {
         Ok(Some(t)) => t,
         Ok(None) => return rpc_err_response(500, &fomat!("No such coin: "(request.coin))),
         Err(err) => return rpc_err_response(500, &fomat!("!lp_coinfind(" (request.coin) "): " (err))),
@@ -922,13 +1079,16 @@ pub fn my_tx_history(ctx: MmArc, req: Json) -> HyRes {
                     .ok_or(format!("from_id {:02x} is not found", id)))
                     + 1
             },
-            None => 0,
+            None => match request.page_number {
+                Some(page_n) => (page_n.get() - 1) * request.limit,
+                None => 0,
+            },
         };
         let history = history.into_iter().skip(skip).take(limit);
         let history: Vec<Json> = history
             .map(|item| {
                 let tx_block = item.block_height;
-                let mut json = unwrap!(json::to_value(item));
+                let mut json = json::to_value(item).unwrap();
                 json["confirmations"] = if tx_block == 0 {
                     Json::from(0)
                 } else if block_number >= tx_block {
@@ -950,6 +1110,8 @@ pub fn my_tx_history(ctx: MmArc, req: Json) -> HyRes {
                     "total": total_records,
                     "current_block": block_number,
                     "sync_status": coin.history_sync_status(),
+                    "page_number": request.page_number,
+                    "total_pages": calc_total_pages(total_records, request.limit),
                 }
             })
             .to_string(),
@@ -959,7 +1121,7 @@ pub fn my_tx_history(ctx: MmArc, req: Json) -> HyRes {
 
 pub async fn get_trade_fee(ctx: MmArc, req: Json) -> Result<Response<Vec<u8>>, String> {
     let ticker = try_s!(req["coin"].as_str().ok_or("No 'coin' field")).to_owned();
-    let coin = match lp_coinfindᵃ(&ctx, &ticker).await {
+    let coin = match lp_coinfind(&ctx, &ticker).await {
         Ok(Some(t)) => t,
         Ok(None) => return ERR!("No such coin: {}", ticker),
         Err(err) => return ERR!("!lp_coinfind({}): {}", ticker, err),
@@ -1017,7 +1179,7 @@ pub struct ConfirmationsReq {
 
 pub async fn set_required_confirmations(ctx: MmArc, req: Json) -> Result<Response<Vec<u8>>, String> {
     let req: ConfirmationsReq = try_s!(json::from_value(req));
-    let coin = match lp_coinfindᵃ(&ctx, &req.coin).await {
+    let coin = match lp_coinfind(&ctx, &req.coin).await {
         Ok(Some(t)) => t,
         Ok(None) => return ERR!("No such coin {}", req.coin),
         Err(err) => return ERR!("!lp_coinfind ({}): {}", req.coin, err),
@@ -1040,7 +1202,7 @@ pub struct RequiresNotaReq {
 
 pub async fn set_requires_notarization(ctx: MmArc, req: Json) -> Result<Response<Vec<u8>>, String> {
     let req: RequiresNotaReq = try_s!(json::from_value(req));
-    let coin = match lp_coinfindᵃ(&ctx, &req.coin).await {
+    let coin = match lp_coinfind(&ctx, &req.coin).await {
         Ok(Some(t)) => t,
         Ok(None) => return ERR!("No such coin {}", req.coin),
         Err(err) => return ERR!("!lp_coinfind ({}): {}", req.coin, err),
@@ -1057,7 +1219,7 @@ pub async fn set_requires_notarization(ctx: MmArc, req: Json) -> Result<Response
 
 pub async fn show_priv_key(ctx: MmArc, req: Json) -> Result<Response<Vec<u8>>, String> {
     let ticker = try_s!(req["coin"].as_str().ok_or("No 'coin' field")).to_owned();
-    let coin = match lp_coinfindᵃ(&ctx, &ticker).await {
+    let coin = match lp_coinfind(&ctx, &ticker).await {
         Ok(Some(t)) => t,
         Ok(None) => return ERR!("No such coin: {}", ticker),
         Err(err) => return ERR!("!lp_coinfind({}): {}", ticker, err),
@@ -1076,19 +1238,15 @@ pub async fn check_balance_update_loop(ctx: MmArc, ticker: String) {
     let mut current_balance = None;
     loop {
         Timer::sleep(10.).await;
-        match lp_coinfindᵃ(&ctx, &ticker).await {
+        match lp_coinfind(&ctx, &ticker).await {
             Ok(Some(coin)) => {
-                let balance = match coin.my_balance().compat().await {
-                    Ok(b) => b,
+                let balance = match coin.my_spendable_balance().compat().await {
+                    Ok(balance) => balance,
                     Err(_) => continue,
                 };
                 if Some(&balance) != current_balance.as_ref() {
-                    let trade_fee = match coin.get_trade_fee().compat().await {
-                        Ok(f) => f,
-                        Err(_) => continue,
-                    };
-                    let coins_ctx = unwrap!(CoinsContext::from_ctx(&ctx));
-                    coins_ctx.balance_updated(&ticker, &balance, &trade_fee).await;
+                    let coins_ctx = CoinsContext::from_ctx(&ctx).unwrap();
+                    coins_ctx.balance_updated(&coin, &balance).await;
                     current_balance = Some(balance);
                 }
             },
@@ -1102,7 +1260,7 @@ pub async fn register_balance_update_handler(
     ctx: MmArc,
     handler: Box<dyn BalanceTradeFeeUpdatedHandler + Send + Sync>,
 ) {
-    let coins_ctx = unwrap!(CoinsContext::from_ctx(&ctx));
+    let coins_ctx = CoinsContext::from_ctx(&ctx).unwrap();
     coins_ctx.balance_update_handlers.lock().await.push(handler);
 }
 
@@ -1156,7 +1314,7 @@ struct ConvertUtxoAddressReq {
 pub async fn convert_utxo_address(ctx: MmArc, req: Json) -> Result<Response<Vec<u8>>, String> {
     let req: ConvertUtxoAddressReq = try_s!(json::from_value(req));
     let mut addr: utxo::Address = try_s!(req.address.parse());
-    let coin = match lp_coinfindᵃ(&ctx, &req.to_coin).await {
+    let coin = match lp_coinfind(&ctx, &req.to_coin).await {
         Ok(Some(c)) => c,
         _ => return ERR!("Coin {} is not activated", req.to_coin),
     };
@@ -1172,4 +1330,14 @@ pub async fn convert_utxo_address(ctx: MmArc, req: Json) -> Result<Response<Vec<
         "result": addr.to_string(),
     })));
     Ok(try_s!(Response::builder().body(response)))
+}
+
+pub fn address_by_coin_conf_and_pubkey_str(coin: &str, conf: &Json, pubkey: &str) -> Result<String, String> {
+    let protocol: CoinProtocol = try_s!(json::from_value(conf["protocol"].clone()));
+    match protocol {
+        CoinProtocol::ERC20 { .. } | CoinProtocol::ETH => eth::addr_from_pubkey_str(pubkey),
+        CoinProtocol::UTXO | CoinProtocol::QTUM | CoinProtocol::QRC20 { .. } => {
+            utxo::address_by_conf_and_pubkey_str(coin, conf, pubkey)
+        },
+    }
 }

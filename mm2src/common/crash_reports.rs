@@ -100,14 +100,14 @@ fn init_signal_handling() {}
 #[test]
 fn test_crash_handling() {
     /* TODO: Implement without `cmd!` (without `duct`).
-        let executable = unwrap!(env::args().next());
-        let executable = unwrap!(Path::new (&executable) .canonicalize());
+        let executable = env::args().next());
+        let executable = Path::new (&executable) .canonicalize());
 
         if env::var ("_MM2_TEST_CRASH_HANDLING_IS_CHILD") != Ok ("1".into()) {
             log!("test_crash_handling] Spawning a child...");
-            let output = unwrap!(cmd!(&executable, "test_crash_handling", "--nocapture")
+            let output = cmd!(&executable, "test_crash_handling", "--nocapture")
                 .env ("_MM2_TEST_CRASH_HANDLING_IS_CHILD", "1")
-                .dir (unwrap!(executable.parent()))  // Might help finding libcurl.dll and pthreadVC2.dll.
+                .dir (executable.parent()))  // Might help finding libcurl.dll and pthreadVC2.dll.
                 .stdout_capture().stderr_capture().unchecked().run());
             let stderr = String::from_utf8_lossy (&output.stderr);
             log!({"Obtained stderr is: ---\n{}", stderr});
@@ -130,7 +130,7 @@ fn test_crash_handling() {
 
 /// Setup the crash handlers.
 #[allow(dead_code)]
-#[cfg(feature = "native")]
+#[cfg(not(target_arch = "wasm32"))]
 pub fn init_crash_reports() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
@@ -156,7 +156,7 @@ pub fn init_crash_reports() {
     })
 }
 
-#[cfg(not(feature = "native"))]
+#[cfg(target_arch = "wasm32")]
 pub fn init_crash_reports() { unimplemented!() }
 
 // Make sure Rust panics still work in the presence of the VEH handler.

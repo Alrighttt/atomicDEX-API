@@ -1,9 +1,16 @@
 use super::*;
 use common::block_on;
-use common::for_tests::wait_for_log;
 use common::mm_ctx::{MmArc, MmCtxBuilder};
-use futures::future::join_all;
 use mocktopus::mocking::*;
+
+/// The gas price for the tests
+const GAS_PRICE: u64 = 50_000_000_000;
+// `GAS_PRICE` increased by 3%
+const GAS_PRICE_APPROXIMATION_ON_START_SWAP: u64 = 51_500_000_000;
+// `GAS_PRICE` increased by 5%
+const GAS_PRICE_APPROXIMATION_ON_ORDER_ISSUE: u64 = 52_500_000_000;
+// `GAS_PRICE` increased by 7%
+const GAS_PRICE_APPROXIMATION_ON_TRADE_PREIMAGE: u64 = 53_500_000_000;
 
 fn check_sum(addr: &str, expected: &str) {
     let actual = checksum_address(addr);
@@ -198,11 +205,10 @@ fn send_and_refund_erc20_payment() {
     let payment = coin
         .send_maker_payment(
             (now_ms() / 1000) as u32 - 200,
-            &unwrap!(hex::decode(
-                "03bc2c7ba671bae4a6fc835244c9762b41647b9827d4780a89a949b984a8ddcc06"
-            )),
+            &DEX_FEE_ADDR_RAW_PUBKEY,
             &[1; 20],
             "0.001".parse().unwrap(),
+            &coin.swap_contract_address(),
         )
         .wait()
         .unwrap();
@@ -215,10 +221,9 @@ fn send_and_refund_erc20_payment() {
         .send_maker_refunds_payment(
             &payment.tx_hex(),
             (now_ms() / 1000) as u32 - 200,
-            &unwrap!(hex::decode(
-                "03bc2c7ba671bae4a6fc835244c9762b41647b9827d4780a89a949b984a8ddcc06"
-            )),
+            &DEX_FEE_ADDR_RAW_PUBKEY,
             &[1; 20],
+            &coin.swap_contract_address(),
         )
         .wait()
         .unwrap();
@@ -258,11 +263,10 @@ fn send_and_refund_eth_payment() {
     let payment = coin
         .send_maker_payment(
             (now_ms() / 1000) as u32 - 200,
-            &unwrap!(hex::decode(
-                "03bc2c7ba671bae4a6fc835244c9762b41647b9827d4780a89a949b984a8ddcc06"
-            )),
+            &DEX_FEE_ADDR_RAW_PUBKEY,
             &[1; 20],
             "0.001".parse().unwrap(),
+            &coin.swap_contract_address(),
         )
         .wait()
         .unwrap();
@@ -275,10 +279,9 @@ fn send_and_refund_eth_payment() {
         .send_maker_refunds_payment(
             &payment.tx_hex(),
             (now_ms() / 1000) as u32 - 200,
-            &unwrap!(hex::decode(
-                "03bc2c7ba671bae4a6fc835244c9762b41647b9827d4780a89a949b984a8ddcc06"
-            )),
+            &DEX_FEE_ADDR_RAW_PUBKEY,
             &[1; 20],
+            &coin.swap_contract_address(),
         )
         .wait()
         .unwrap();
@@ -347,7 +350,7 @@ fn test_nonce_several_urls() {
 
 #[test]
 fn test_wait_for_payment_spend_timeout() {
-    EthCoinImpl::spend_events.mock_safe(|_, _| MockResult::Return(Box::new(futures01::future::ok(vec![]))));
+    EthCoinImpl::spend_events.mock_safe(|_, _, _| MockResult::Return(Box::new(futures01::future::ok(vec![]))));
 
     let key_pair = KeyPair::from_secret_slice(
         &hex::decode("809465b17d0a4ddb3e4c69e8f23c2cabad868f51f8bed5c765ad1d6516c3306f").unwrap(),
@@ -393,7 +396,7 @@ fn test_wait_for_payment_spend_timeout() {
     ];
 
     assert!(coin
-        .wait_for_tx_spend(&tx_bytes, wait_until, from_block)
+        .wait_for_tx_spend(&tx_bytes, wait_until, from_block, &coin.swap_contract_address())
         .wait()
         .is_err());
 }
@@ -411,6 +414,7 @@ fn test_search_for_swap_tx_spend_was_spent() {
     let web3 = Web3::new(transport);
     let ctx = MmCtxBuilder::new().into_mm_arc();
 
+    let swap_contract_address = Address::from("0x7Bc1bBDD6A0a722fC9bffC49c921B685ECB84b94");
     let coin = EthCoin(Arc::new(EthCoinImpl {
         coin_type: EthCoinType::Eth,
         decimals: 18,
@@ -418,7 +422,7 @@ fn test_search_for_swap_tx_spend_was_spent() {
         history_sync_state: Mutex::new(HistorySyncState::NotEnabled),
         my_address: key_pair.address(),
         key_pair,
-        swap_contract_address: Address::from("0x7Bc1bBDD6A0a722fC9bffC49c921B685ECB84b94"),
+        swap_contract_address,
         ticker: "ETH".into(),
         web3_instances: vec![Web3Instance {
             web3: web3.clone(),
@@ -455,9 +459,12 @@ fn test_search_for_swap_tx_spend_was_spent() {
         243, 128, 2, 235, 208, 193, 192, 74, 208, 242, 26, 221, 83, 54, 74, 160, 111, 29, 92, 8, 75, 61, 97, 103, 199,
         100, 189, 72, 74, 221, 144, 66, 170, 68, 121, 29, 105, 19, 194, 35, 245, 196, 131, 236, 29, 105, 101, 30,
     ];
-    let spend_tx = FoundSwapTxSpend::Spent(unwrap!(signed_eth_tx_from_bytes(&spend_tx)).into());
+    let spend_tx = FoundSwapTxSpend::Spent(signed_eth_tx_from_bytes(&spend_tx).unwrap().into());
 
-    let found_tx = unwrap!(unwrap!(coin.search_for_swap_tx_spend(&payment_tx, 6051857,)));
+    let found_tx = coin
+        .search_for_swap_tx_spend(&payment_tx, swap_contract_address, 6051857)
+        .unwrap()
+        .unwrap();
     assert_eq!(spend_tx, found_tx);
 }
 
@@ -474,6 +481,7 @@ fn test_search_for_swap_tx_spend_was_refunded() {
     let web3 = Web3::new(transport);
     let ctx = MmCtxBuilder::new().into_mm_arc();
 
+    let swap_contract_address = Address::from("0x7Bc1bBDD6A0a722fC9bffC49c921B685ECB84b94");
     let coin = EthCoin(Arc::new(EthCoinImpl {
         coin_type: EthCoinType::Erc20(Address::from("0xc0eb7aed740e1796992a08962c15661bdeb58003")),
         decimals: 18,
@@ -481,7 +489,7 @@ fn test_search_for_swap_tx_spend_was_refunded() {
         history_sync_state: Mutex::new(HistorySyncState::NotEnabled),
         my_address: key_pair.address(),
         key_pair,
-        swap_contract_address: Address::from("0x7Bc1bBDD6A0a722fC9bffC49c921B685ECB84b94"),
+        swap_contract_address,
         ticker: "ETH".into(),
         web3_instances: vec![Web3Instance {
             web3: web3.clone(),
@@ -519,9 +527,12 @@ fn test_search_for_swap_tx_spend_was_refunded() {
         19, 27, 208, 119, 219, 60, 231, 2, 118, 91, 169, 99, 78, 209, 135, 160, 51, 115, 90, 189, 124, 172, 205, 134,
         203, 159, 238, 40, 39, 99, 88, 48, 160, 189, 37, 60, 20, 117, 65, 238, 36, 98, 226, 48, 22, 235, 86, 183,
     ];
-    let refund_tx = FoundSwapTxSpend::Refunded(unwrap!(signed_eth_tx_from_bytes(&refund_tx)).into());
+    let refund_tx = FoundSwapTxSpend::Refunded(signed_eth_tx_from_bytes(&refund_tx).unwrap().into());
 
-    let found_tx = unwrap!(unwrap!(coin.search_for_swap_tx_spend(&payment_tx, 5886908,)));
+    let found_tx = coin
+        .search_for_swap_tx_spend(&payment_tx, swap_contract_address, 5886908)
+        .unwrap()
+        .unwrap();
     assert_eq!(refund_tx, found_tx);
 }
 
@@ -547,7 +558,7 @@ fn test_withdraw_impl_manual_fee() {
     };
     coin.my_balance().wait().unwrap();
 
-    let tx_details = unwrap!(block_on(withdraw_impl(ctx, coin.clone(), withdraw_req)));
+    let tx_details = block_on(withdraw_impl(ctx, coin.clone(), withdraw_req)).unwrap();
     let expected = Some(
         EthTxFeeDetails {
             coin: "ETH".into(),
@@ -561,7 +572,11 @@ fn test_withdraw_impl_manual_fee() {
 }
 
 #[test]
+#[cfg(not(target_arch = "wasm32"))]
 fn test_nonce_lock() {
+    use common::for_tests::wait_for_log;
+    use futures::future::join_all;
+
     // send several transactions concurrently to check that they are not using same nonce
     // using real ETH dev node
     let (ctx, coin) = eth_coin_for_test(EthCoinType::Eth, vec!["http://195.201.0.6:8565".into()]);
@@ -578,157 +593,331 @@ fn test_nonce_lock() {
     }
     let results = block_on(join_all(futures));
     for result in results {
-        unwrap!(result);
+        result.unwrap();
     }
     // Waiting for NONCE_LOCK… might not appear at all if waiting takes less than 0.5 seconds
     // but all transactions are sent successfully still
-    // unwrap!(wait_for_log(&ctx.log, 1.1, &|line| line.contains("Waiting for NONCE_LOCK…")));
-    unwrap!(wait_for_log(&ctx.log, 1.1, &|line| line.contains("get_addr_nonce…")));
-}
-
-#[cfg(feature = "w-bindgen")]
-mod wasm_bindgen_tests {
-    use super::*;
-    use crate::lp_coininit;
-    use wasm_bindgen::prelude::*;
-    use wasm_bindgen_test::*;
-    use web_sys::console;
-
-    #[wasm_bindgen_test]
-    fn pass() {
-        use super::CoinsContext;
-        use common::mm_ctx::MmCtxBuilder;
-        let ctx = MmCtxBuilder::default().into_mm_arc();
-        let coins_context = unwrap!(CoinsContext::from_ctx(&ctx));
-        assert_eq!(1, 1);
-    }
-
-    #[wasm_bindgen]
-    extern "C" {
-        fn setInterval(closure: &Closure<FnMut()>, millis: u32) -> f64;
-        fn cancelInterval(token: f64);
-    }
-
-    wasm_bindgen_test_configure!(run_in_browser);
-
-    pub struct Interval {
-        closure: Closure<FnMut()>,
-    }
-
-    impl Interval {
-        fn new() -> Interval {
-            let closure = Closure::new(common::executor::run);
-            Interval { closure }
-        }
-    }
-
-    unsafe impl Send for Interval {}
-
-    unsafe impl Sync for Interval {}
-
-    lazy_static! {
-        static ref EXECUTOR_INTERVAL: Interval = Interval::new();
-    }
-
-    #[wasm_bindgen_test(async)]
-    fn test_send() -> impl Future<Item = (), Error = JsValue> {
-        setInterval(&EXECUTOR_INTERVAL.closure, 200);
-        Box::pin(async move {
-            let key_pair = KeyPair::from_secret_slice(
-                &hex::decode("809465b17d0a4ddb3e4c69e8f23c2cabad868f51f8bed5c765ad1d6516c3306f").unwrap(),
-            )
-            .unwrap();
-            let transport = Web3Transport::new(vec!["http://195.201.0.6:8565".into()]).unwrap();
-            let web3 = Web3::new(transport);
-            let ctx = MmCtxBuilder::new().into_mm_arc();
-            let coin = EthCoin(Arc::new(EthCoinImpl {
-                ticker: "ETH".into(),
-                coin_type: EthCoinType::Eth,
-                my_address: key_pair.address(),
-                key_pair,
-                swap_contract_address: Address::from("0x7Bc1bBDD6A0a722fC9bffC49c921B685ECB84b94"),
-                web3_instances: vec![Web3Instance {
-                    web3: web3.clone(),
-                    is_parity: true,
-                }],
-                web3,
-                decimals: 18,
-                gas_station_url: None,
-                history_sync_state: Mutex::new(HistorySyncState::NotStarted),
-                ctx: ctx.weak(),
-                required_confirmations: 1.into(),
-            }));
-            let tx = coin
-                .send_maker_payment(
-                    1000,
-                    &unwrap!(hex::decode(
-                        "03bc2c7ba671bae4a6fc835244c9762b41647b9827d4780a89a949b984a8ddcc06"
-                    )),
-                    &[1; 20],
-                    "0.001".parse().unwrap(),
-                )
-                .compat()
-                .await;
-            console::log_1(&format!("{:?}", tx).into());
-
-            let block = coin.current_block().compat().await;
-            console::log_1(&format!("{:?}", block).into());
-            Ok(())
-        })
-        .compat()
-    }
-
-    #[wasm_bindgen_test(async)]
-    fn test_init_eth_coin() -> impl Future<Item = (), Error = JsValue> {
-        use common::privkey::key_pair_from_seed;
-
-        setInterval(&EXECUTOR_INTERVAL.closure, 200);
-        Box::pin(async move {
-            let key_pair =
-                key_pair_from_seed("spice describe gravity federal blast come thank unfair canal monkey style afraid")
-                    .unwrap();
-            let conf = json!({
-                "coins": [{
-                    "coin": "ETH",
-                    "name": "ethereum",
-                    "fname": "Ethereum",
-                    "protocol":{
-                        "type": "ETH"
-                    },
-                    "rpcport": 80,
-                    "mm2": 1
-                }]
-            });
-            let ctx = MmCtxBuilder::new()
-                .with_conf(conf)
-                .with_secp256k1_key_pair(key_pair)
-                .into_mm_arc();
-
-            let req = json!({
-                "urls":["http://195.201.0.6:8565"],
-                "swap_contract_address":"0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48"
-            });
-            let coin = lp_coininit(&ctx, "ETH", &req).await.unwrap();
-            Ok(())
-        })
-        .compat()
-    }
+    // wait_for_log(&ctx.log, 1.1, &|line| line.contains("Waiting for NONCE_LOCK…")));
+    wait_for_log(&ctx.log, 1.1, &|line| line.contains("get_addr_nonce…")).unwrap();
 }
 
 #[test]
 fn test_add_ten_pct_one_gwei() {
     let num = wei_from_big_decimal(&"0.1".parse().unwrap(), 9).unwrap();
     let expected = wei_from_big_decimal(&"1.1".parse().unwrap(), 9).unwrap();
-    let actual = add_ten_pct_one_gwei(num);
+    let actual = increase_by_percent_one_gwei(num, GAS_PRICE_PERCENT);
     assert_eq!(expected, actual);
 
     let num = wei_from_big_decimal(&"9.9".parse().unwrap(), 9).unwrap();
     let expected = wei_from_big_decimal(&"10.9".parse().unwrap(), 9).unwrap();
-    let actual = add_ten_pct_one_gwei(num);
+    let actual = increase_by_percent_one_gwei(num, GAS_PRICE_PERCENT);
     assert_eq!(expected, actual);
 
     let num = wei_from_big_decimal(&"30.1".parse().unwrap(), 9).unwrap();
     let expected = wei_from_big_decimal(&"33.11".parse().unwrap(), 9).unwrap();
-    let actual = add_ten_pct_one_gwei(num);
+    let actual = increase_by_percent_one_gwei(num, GAS_PRICE_PERCENT);
     assert_eq!(expected, actual);
+}
+
+#[test]
+fn get_sender_trade_preimage() {
+    /// Trade fee for the ETH coin is `2 * 150_000 * gas_price` always.
+    fn expected_fee(gas_price: u64) -> TradeFee {
+        let amount = u256_to_big_decimal((2 * 150_000 * gas_price).into(), 18).expect("!u256_to_big_decimal");
+        TradeFee {
+            coin: "ETH".to_owned(),
+            amount: amount.into(),
+        }
+    }
+
+    EthCoinImpl::get_gas_price.mock_safe(|_| MockResult::Return(Box::new(futures01::future::ok(GAS_PRICE.into()))));
+
+    let (_ctx, coin) = eth_coin_for_test(EthCoinType::Eth, vec!["http://dummy.dummy".into()]);
+
+    let actual = coin
+        .get_sender_trade_fee(
+            TradePreimageValue::UpperBound(150.into()),
+            FeeApproxStage::WithoutApprox,
+        )
+        .wait()
+        .expect("!get_sender_trade_fee");
+    let expected = expected_fee(GAS_PRICE);
+    assert_eq!(actual, expected);
+
+    let value = u256_to_big_decimal(100.into(), 18).expect("!u256_to_big_decimal");
+    let actual = coin
+        .get_sender_trade_fee(TradePreimageValue::Exact(value), FeeApproxStage::OrderIssue)
+        .wait()
+        .expect("!get_sender_trade_fee");
+    let expected = expected_fee(GAS_PRICE_APPROXIMATION_ON_ORDER_ISSUE);
+    assert_eq!(actual, expected);
+
+    let value = u256_to_big_decimal(1.into(), 18).expect("!u256_to_big_decimal");
+    let actual = coin
+        .get_sender_trade_fee(TradePreimageValue::Exact(value), FeeApproxStage::StartSwap)
+        .wait()
+        .expect("!get_sender_trade_fee");
+    let expected = expected_fee(GAS_PRICE_APPROXIMATION_ON_START_SWAP);
+    assert_eq!(actual, expected);
+
+    let value = u256_to_big_decimal(10000000000u64.into(), 18).expect("!u256_to_big_decimal");
+    let actual = coin
+        .get_sender_trade_fee(TradePreimageValue::Exact(value), FeeApproxStage::TradePreimage)
+        .wait()
+        .expect("!get_sender_trade_fee");
+    let expected = expected_fee(GAS_PRICE_APPROXIMATION_ON_TRADE_PREIMAGE);
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn get_erc20_sender_trade_preimage() {
+    static mut ALLOWANCE: u64 = 0;
+    EthCoin::allowance
+        .mock_safe(|_, _| MockResult::Return(Box::new(futures01::future::ok(unsafe { ALLOWANCE.into() }))));
+
+    EthCoinImpl::get_gas_price.mock_safe(|_| MockResult::Return(Box::new(futures01::future::ok(GAS_PRICE.into()))));
+
+    fn expected_trade_fee(gas_limit: u64, gas_price: u64) -> TradeFee {
+        let amount = u256_to_big_decimal((gas_limit * gas_price).into(), 18).expect("!u256_to_big_decimal");
+        TradeFee {
+            coin: "ETH".to_owned(),
+            amount: amount.into(),
+        }
+    }
+
+    let (_ctx, coin) = eth_coin_for_test(
+        EthCoinType::Erc20(Address::default()),
+        vec!["http://dummy.dummy".into()],
+    );
+
+    // value is allowed
+    unsafe { ALLOWANCE = 1000 };
+    let value = u256_to_big_decimal(1000.into(), 18).expect("u256_to_big_decimal");
+    let actual = coin
+        .get_sender_trade_fee(TradePreimageValue::UpperBound(value), FeeApproxStage::WithoutApprox)
+        .wait()
+        .expect("!get_sender_trade_fee");
+    log!([actual.amount.to_decimal()]);
+    assert_eq!(actual, expected_trade_fee(300_000, GAS_PRICE));
+
+    // value is greater than allowance
+    unsafe { ALLOWANCE = 999 };
+    let value = u256_to_big_decimal(1000.into(), 18).expect("u256_to_big_decimal");
+    let actual = coin
+        .get_sender_trade_fee(TradePreimageValue::UpperBound(value), FeeApproxStage::StartSwap)
+        .wait()
+        .expect("!get_sender_trade_fee");
+    assert_eq!(
+        actual,
+        expected_trade_fee(350_000, GAS_PRICE_APPROXIMATION_ON_START_SWAP)
+    );
+
+    // value is allowed
+    unsafe { ALLOWANCE = 1000 };
+    let value = u256_to_big_decimal(999.into(), 18).expect("u256_to_big_decimal");
+    let actual = coin
+        .get_sender_trade_fee(TradePreimageValue::Exact(value), FeeApproxStage::OrderIssue)
+        .wait()
+        .expect("!get_sender_trade_fee");
+    assert_eq!(
+        actual,
+        expected_trade_fee(300_000, GAS_PRICE_APPROXIMATION_ON_ORDER_ISSUE)
+    );
+
+    // value is greater than allowance
+    unsafe { ALLOWANCE = 1000 };
+    let value = u256_to_big_decimal(1500.into(), 18).expect("u256_to_big_decimal");
+    let actual = coin
+        .get_sender_trade_fee(TradePreimageValue::Exact(value), FeeApproxStage::TradePreimage)
+        .wait()
+        .expect("!get_sender_trade_fee");
+    assert_eq!(
+        actual,
+        expected_trade_fee(350_000, GAS_PRICE_APPROXIMATION_ON_TRADE_PREIMAGE)
+    );
+}
+
+#[test]
+fn get_receiver_trade_preimage() {
+    EthCoinImpl::get_gas_price.mock_safe(|_| MockResult::Return(Box::new(futures01::future::ok(GAS_PRICE.into()))));
+
+    let (_ctx, coin) = eth_coin_for_test(EthCoinType::Eth, vec!["http://dummy.dummy".into()]);
+    let amount = u256_to_big_decimal((150_000 * GAS_PRICE).into(), 18).expect("!u256_to_big_decimal");
+    let expected_fee = TradeFee {
+        coin: "ETH".to_owned(),
+        amount: amount.into(),
+    };
+
+    let actual = coin
+        .get_receiver_trade_fee(FeeApproxStage::WithoutApprox)
+        .wait()
+        .expect("!get_sender_trade_fee");
+    assert_eq!(actual, expected_fee);
+}
+
+#[test]
+fn test_get_fee_to_send_taker_fee() {
+    const DEX_FEE_AMOUNT: u64 = 100_000;
+    const TRANSFER_GAS_LIMIT: u64 = 40_000;
+
+    EthCoinImpl::get_gas_price.mock_safe(|_| MockResult::Return(Box::new(futures01::future::ok(GAS_PRICE.into()))));
+    EthCoinImpl::estimate_gas
+        .mock_safe(|_, _, _| MockResult::Return(Box::new(futures01::future::ok(TRANSFER_GAS_LIMIT.into()))));
+
+    // fee to send taker fee is `TRANSFER_GAS_LIMIT * gas_price` always.
+    let amount = u256_to_big_decimal((TRANSFER_GAS_LIMIT * GAS_PRICE).into(), 18).expect("!u256_to_big_decimal");
+    let expected_fee = TradeFee {
+        coin: "ETH".to_owned(),
+        amount: amount.into(),
+    };
+
+    let dex_fee_amount = u256_to_big_decimal(DEX_FEE_AMOUNT.into(), 18).expect("!u256_to_big_decimal");
+
+    let (_ctx, coin) = eth_coin_for_test(EthCoinType::Eth, vec!["http://dummy.dummy".into()]);
+    let actual = coin
+        .get_fee_to_send_taker_fee(dex_fee_amount.clone(), FeeApproxStage::WithoutApprox)
+        .wait()
+        .expect("!get_fee_to_send_taker_fee");
+    assert_eq!(actual, expected_fee);
+
+    let (_ctx, coin) = eth_coin_for_test(
+        EthCoinType::Erc20(Address::from("0xaD22f63404f7305e4713CcBd4F296f34770513f4")),
+        vec!["http://dummy.dummy".into()],
+    );
+    let actual = coin
+        .get_fee_to_send_taker_fee(dex_fee_amount.clone(), FeeApproxStage::WithoutApprox)
+        .wait()
+        .expect("!get_fee_to_send_taker_fee");
+    assert_eq!(actual, expected_fee);
+}
+
+/// Some ERC20 tokens return the `error: -32016, message: \"The execution failed due to an exception.\"` error
+/// if the balance is insufficient.
+/// So [`EthCoin::get_fee_to_send_taker_fee`] must return [`TradePreimageError::NotSufficientBalance`].
+#[test]
+fn test_get_fee_to_send_taker_fee_insufficient_balance() {
+    const DEX_FEE_AMOUNT: u64 = 100_000_000_000;
+
+    EthCoinImpl::get_gas_price.mock_safe(|_| MockResult::Return(Box::new(futures01::future::ok(40.into()))));
+    let (_ctx, coin) = eth_coin_for_test(
+        EthCoinType::Erc20(Address::from("0xaD22f63404f7305e4713CcBd4F296f34770513f4")),
+        vec!["http://eth1.cipig.net:8555".into()],
+    );
+    let dex_fee_amount = u256_to_big_decimal(DEX_FEE_AMOUNT.into(), 18).expect("!u256_to_big_decimal");
+
+    assert!(
+        coin.get_fee_to_send_taker_fee(dex_fee_amount.clone(), FeeApproxStage::WithoutApprox)
+            .wait()
+            .is_err(),
+        "Expected TradePreimageError::NotSufficientBalance"
+    );
+}
+
+#[test]
+fn validate_dex_fee_invalid_sender_eth() {
+    let (_ctx, coin) = eth_coin_for_test(EthCoinType::Eth, vec!["http://eth1.cipig.net:8555".into()]);
+    // the real dex fee sent on mainnet
+    // https://etherscan.io/tx/0x7e9ca16c85efd04ee5e31f2c1914b48f5606d6f9ce96ecce8c96d47d6857278f
+    let tx = coin
+        .web3
+        .eth()
+        .transaction(TransactionId::Hash(
+            "0x7e9ca16c85efd04ee5e31f2c1914b48f5606d6f9ce96ecce8c96d47d6857278f".into(),
+        ))
+        .wait()
+        .unwrap()
+        .unwrap();
+    let tx = signed_tx_from_web3_tx(tx).unwrap().into();
+    let amount: BigDecimal = "0.000526435076465".parse().unwrap();
+    let validate_err = coin
+        .validate_fee(&tx, &*DEX_FEE_ADDR_RAW_PUBKEY, &*DEX_FEE_ADDR_RAW_PUBKEY, &amount, 0)
+        .wait()
+        .unwrap_err();
+    assert!(validate_err.contains("was sent from wrong address"));
+}
+
+#[test]
+fn validate_dex_fee_invalid_sender_erc() {
+    let (_ctx, coin) = eth_coin_for_test(
+        EthCoinType::Erc20("0xa1d6df714f91debf4e0802a542e13067f31b8262".into()),
+        vec!["http://eth1.cipig.net:8555".into()],
+    );
+    // the real dex fee sent on mainnet
+    // https://etherscan.io/tx/0xd6403b41c79f9c9e9c83c03d920ee1735e7854d85d94cef48d95dfeca95cd600
+    let tx = coin
+        .web3
+        .eth()
+        .transaction(TransactionId::Hash(
+            "0xd6403b41c79f9c9e9c83c03d920ee1735e7854d85d94cef48d95dfeca95cd600".into(),
+        ))
+        .wait()
+        .unwrap()
+        .unwrap();
+    let tx = signed_tx_from_web3_tx(tx).unwrap().into();
+    let amount: BigDecimal = "5.548262548262548262".parse().unwrap();
+    let validate_err = coin
+        .validate_fee(&tx, &*DEX_FEE_ADDR_RAW_PUBKEY, &*DEX_FEE_ADDR_RAW_PUBKEY, &amount, 0)
+        .wait()
+        .unwrap_err();
+    assert!(validate_err.contains("was sent from wrong address"));
+}
+
+fn sender_compressed_pub(tx: &SignedEthTx) -> [u8; 33] {
+    let raw_pubkey = tx.public.unwrap();
+    let secp_public = PublicKey::parse_slice(&raw_pubkey, None).unwrap();
+    secp_public.serialize_compressed()
+}
+
+#[test]
+fn validate_dex_fee_eth_confirmed_before_min_block() {
+    let (_ctx, coin) = eth_coin_for_test(EthCoinType::Eth, vec!["http://eth1.cipig.net:8555".into()]);
+    // the real dex fee sent on mainnet
+    // https://etherscan.io/tx/0x7e9ca16c85efd04ee5e31f2c1914b48f5606d6f9ce96ecce8c96d47d6857278f
+    let tx = coin
+        .web3
+        .eth()
+        .transaction(TransactionId::Hash(
+            "0x7e9ca16c85efd04ee5e31f2c1914b48f5606d6f9ce96ecce8c96d47d6857278f".into(),
+        ))
+        .wait()
+        .unwrap()
+        .unwrap();
+    let tx = signed_tx_from_web3_tx(tx).unwrap();
+    let compressed_public = sender_compressed_pub(&tx);
+    let tx = tx.into();
+    let amount: BigDecimal = "0.000526435076465".parse().unwrap();
+    let validate_err = coin
+        .validate_fee(&tx, &compressed_public, &*DEX_FEE_ADDR_RAW_PUBKEY, &amount, 11784793)
+        .wait()
+        .unwrap_err();
+    assert!(validate_err.contains("confirmed before min_block"));
+}
+
+#[test]
+fn validate_dex_fee_erc_confirmed_before_min_block() {
+    let (_ctx, coin) = eth_coin_for_test(
+        EthCoinType::Erc20("0xa1d6df714f91debf4e0802a542e13067f31b8262".into()),
+        vec!["http://eth1.cipig.net:8555".into()],
+    );
+    // the real dex fee sent on mainnet
+    // https://etherscan.io/tx/0xd6403b41c79f9c9e9c83c03d920ee1735e7854d85d94cef48d95dfeca95cd600
+    let tx = coin
+        .web3
+        .eth()
+        .transaction(TransactionId::Hash(
+            "0xd6403b41c79f9c9e9c83c03d920ee1735e7854d85d94cef48d95dfeca95cd600".into(),
+        ))
+        .wait()
+        .unwrap()
+        .unwrap();
+
+    let tx = signed_tx_from_web3_tx(tx).unwrap();
+    let compressed_public = sender_compressed_pub(&tx);
+    let tx = tx.into();
+    let amount: BigDecimal = "5.548262548262548262".parse().unwrap();
+    let validate_err = coin
+        .validate_fee(&tx, &compressed_public, &*DEX_FEE_ADDR_RAW_PUBKEY, &amount, 11823975)
+        .wait()
+        .unwrap_err();
+    assert!(validate_err.contains("confirmed before min_block"));
 }

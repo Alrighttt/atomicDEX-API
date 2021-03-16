@@ -17,9 +17,9 @@
 //  marketmaker
 //
 use common::executor::spawn;
-#[cfg(not(feature = "native"))] use common::helperᶜ;
+use common::log;
 use common::mm_ctx::MmArc;
-use common::HyRes;
+use common::mm_metrics::{ClockOps, MetricsOps};
 use futures::{channel::oneshot, lock::Mutex as AsyncMutex, StreamExt};
 use mm2_libp2p::atomicdex_behaviour::{AdexBehaviourCmd, AdexBehaviourEvent, AdexCmdTx, AdexEventRx, AdexResponse,
                                       AdexResponseChannel};
@@ -80,7 +80,7 @@ pub async fn p2p_event_process_loop(ctx: MmArc, mut rx: AdexEventRx, i_am_relay:
                 response_channel,
             }) => {
                 if let Err(e) = process_p2p_request(ctx.clone(), peer_id, request, response_channel).await {
-                    log!("Error on process P2P request: "[e]);
+                    log::error!("Error on process P2P request: {:?}", e);
                 }
             },
             None => break,
@@ -156,14 +156,13 @@ async fn process_p2p_request(
     Ok(())
 }
 
-#[cfg(feature = "native")]
 pub fn broadcast_p2p_msg(ctx: &MmArc, topics: Vec<String>, msg: Vec<u8>) {
     let ctx = ctx.clone();
     spawn(async move {
         let cmd = AdexBehaviourCmd::PublishMsg { topics, msg };
         let p2p_ctx = P2PContext::fetch_from_mm_arc(&ctx);
         if let Err(e) = p2p_ctx.cmd_tx.lock().await.try_send(cmd) {
-            log!("broadcast_p2p_msg cmd_tx.send error "[e]);
+            log::error!("broadcast_p2p_msg cmd_tx.send error {:?}", e);
         };
     });
 }
@@ -173,16 +172,14 @@ pub fn broadcast_p2p_msg(ctx: &MmArc, topics: Vec<String>, msg: Vec<u8>) {
 /// # Safety
 ///
 /// The function locks the [`MmCtx::p2p_ctx`] mutext.
-#[cfg(feature = "native")]
 pub async fn subscribe_to_topic(ctx: &MmArc, topic: String) {
     let p2p_ctx = P2PContext::fetch_from_mm_arc(ctx);
     let cmd = AdexBehaviourCmd::Subscribe { topic };
     if let Err(e) = p2p_ctx.cmd_tx.lock().await.try_send(cmd) {
-        log!("subscribe_to_topic cmd_tx.send error "[e]);
+        log::error!("subscribe_to_topic cmd_tx.send error {:?}", e);
     };
 }
 
-#[cfg(feature = "native")]
 pub async fn request_any_relay<T: de::DeserializeOwned>(
     ctx: MmArc,
     req: P2PRequest,
@@ -212,8 +209,6 @@ pub enum PeerDecodedResponse<T> {
 }
 
 #[allow(dead_code)]
-#[cfg(feature = "native")]
-#[allow(dead_code)]
 pub async fn request_relays<T: de::DeserializeOwned>(
     ctx: MmArc,
     req: P2PRequest,
@@ -231,7 +226,6 @@ pub async fn request_relays<T: de::DeserializeOwned>(
     Ok(parse_peers_responses(responses))
 }
 
-#[cfg(feature = "native")]
 pub async fn request_peers<T: de::DeserializeOwned>(
     ctx: MmArc,
     req: P2PRequest,
@@ -251,16 +245,15 @@ pub async fn request_peers<T: de::DeserializeOwned>(
     Ok(parse_peers_responses(responses))
 }
 
-#[cfg(feature = "native")]
 pub async fn request_one_peer<T: de::DeserializeOwned>(
     ctx: MmArc,
     req: P2PRequest,
     peer: String,
 ) -> Result<Option<T>, String> {
-    let metrics_sink = ctx.metrics.sink().expect("Metrics sink is not available");
-    let start = metrics_sink.now();
+    let clock = ctx.metrics.clock().expect("Metrics clock is not available");
+    let start = clock.now();
     let mut responses = try_s!(request_peers::<T>(ctx.clone(), req, vec![peer.clone()]).await);
-    let end = metrics_sink.now();
+    let end = clock.now();
     mm_timing!(ctx.metrics, "peer.outgoing_request.timing", start, end, "peer" => peer);
     if responses.len() != 1 {
         return ERR!("Expected 1 response, found {}", responses.len());
@@ -292,7 +285,6 @@ fn parse_peers_responses<T: de::DeserializeOwned>(
         .collect()
 }
 
-#[cfg(feature = "native")]
 pub fn propagate_message(ctx: &MmArc, message_id: MessageId, propagation_source: PeerId) {
     let ctx = ctx.clone();
     spawn(async move {
@@ -302,16 +294,7 @@ pub fn propagate_message(ctx: &MmArc, message_id: MessageId, propagation_source:
             propagation_source,
         };
         if let Err(e) = p2p_ctx.cmd_tx.lock().await.try_send(cmd) {
-            log!("propagate_message cmd_tx.send error "[e]);
+            log::error!("propagate_message cmd_tx.send error {:?}", e);
         };
     });
-}
-
-/// Result of `fn dispatcher`.
-#[allow(dead_code)]
-pub enum DispatcherRes {
-    /// `fn dispatcher` has found a Rust handler for the RPC "method".
-    Match(HyRes),
-    /// No handler found by `fn dispatcher`. Returning the `Json` request in order for it to be handled elsewhere.
-    NoMatch,
 }

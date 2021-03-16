@@ -36,10 +36,6 @@ jobs:
           echo "##vso[task.setvariable variable=RELEASE_UPLOADED]${RELEASE_UPLOADED}"
           echo "##vso[task.setvariable variable=RELEASE_TAG]${RELEASE_TAG}"
         displayName: Setup ENV
-      - powershell: |
-          .\marketmaker_build_depends.cmd
-        displayName: Build Windows deps
-        condition: and( eq( variables['Agent.OS'], 'Windows_NT' ), eq( variables['COMMIT_TAG'], '' ) )
       - bash: |
           rm -rf upload
           mkdir upload
@@ -60,9 +56,9 @@ jobs:
             -w $PWD \
             -e HOME=/root \
             mm2_builder \
-            /bin/bash -c "source /root/.cargo/env && cargo build --features native -vv --target-dir target-xenial"
+            /bin/bash -c "source /root/.cargo/env && cargo build -vv --target-dir target-xenial"
           else
-            cargo +nightly build --features native -vv
+            cargo build -vv
           fi
         displayName: 'Build MM2 Debug'
         condition: eq( variables['DEBUG_UPLOADED'], '' )
@@ -97,9 +93,9 @@ jobs:
             -w $PWD \
             -e HOME=/root \
             mm2_builder \
-            /bin/bash -c "source /root/.cargo/env && cargo build --features native --release -vv --target-dir target-xenial"
+            /bin/bash -c "source /root/.cargo/env && cargo build --release -vv --target-dir target-xenial"
           else
-            cargo +nightly build --features native --release -vv
+            cargo build --release -vv
           fi
         displayName: 'Build MM2 Release'
         condition: eq( variables['RELEASE_UPLOADED'], '' )

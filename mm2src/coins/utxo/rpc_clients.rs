@@ -1,6 +1,6 @@
-#![cfg_attr(not(feature = "native"), allow(unused_imports))]
-#![cfg_attr(not(feature = "native"), allow(unused_macros))]
-#![cfg_attr(not(feature = "native"), allow(dead_code))]
+#![cfg_attr(target_arch = "wasm32", allow(unused_imports))]
+#![cfg_attr(target_arch = "wasm32", allow(unused_macros))]
+#![cfg_attr(target_arch = "wasm32", allow(dead_code))]
 
 use crate::utxo::sat_from_big_decimal;
 use crate::{RpcTransportEventHandler, RpcTransportEventHandlerShared};
@@ -14,7 +14,7 @@ use common::mm_number::MmNumber;
 use common::wio::slurp_req;
 use common::{median, OrdRange, StringError};
 use futures::channel::oneshot as async_oneshot;
-#[cfg(not(feature = "native"))]
+#[cfg(target_arch = "wasm32")]
 use futures::channel::oneshot::Sender as ShotSender;
 use futures::compat::{Future01CompatExt, Stream01CompatExt};
 use futures::future::{select as select_func, Either, FutureExt, TryFutureExt};
@@ -31,8 +31,8 @@ use http::Uri;
 use http::{Request, StatusCode};
 use keys::Address;
 #[cfg(test)] use mocktopus::macros::*;
-use rpc::v1::types::{Bytes as BytesJson, Transaction as RpcTransaction, VerboseBlockClient, H256 as H256Json};
-#[cfg(feature = "native")] use rustls::{self};
+use rpc::v1::types::{Bytes as BytesJson, Transaction as RpcTransaction, H256 as H256Json};
+#[cfg(not(target_arch = "wasm32"))] use rustls::{self};
 use script::Builder;
 use serde_json::{self as json, Value as Json};
 use serialization::{deserialize, serialize, CompactInteger, Reader};
@@ -43,24 +43,33 @@ use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::num::NonZeroU64;
 use std::ops::Deref;
-#[cfg(not(feature = "native"))] use std::os::raw::c_char;
+#[cfg(target_arch = "wasm32")] use std::os::raw::c_char;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
-#[cfg(feature = "native")]
+#[cfg(not(target_arch = "wasm32"))]
 use tokio::io::{AsyncBufReadExt, AsyncRead, AsyncWrite, AsyncWriteExt, BufReader};
-#[cfg(feature = "native")] use tokio::net::TcpStream;
-#[cfg(feature = "native")] use tokio_rustls::webpki::DNSNameRef;
-#[cfg(feature = "native")]
+#[cfg(not(target_arch = "wasm32"))] use tokio::net::TcpStream;
+#[cfg(not(target_arch = "wasm32"))]
+use tokio_rustls::webpki::DNSNameRef;
+#[cfg(not(target_arch = "wasm32"))]
 use tokio_rustls::{client::TlsStream, TlsConnector};
-#[cfg(feature = "native")] use webpki_roots::TLS_SERVER_ROOTS;
+#[cfg(not(target_arch = "wasm32"))]
+use webpki_roots::TLS_SERVER_ROOTS;
+
+pub type AddressesByLabelResult = HashMap<String, AddressPurpose>;
+
+#[derive(Debug, Deserialize)]
+pub struct AddressPurpose {
+    purpose: String,
+}
 
 /// Skips the server certificate verification on TLS connection
 pub struct NoCertificateVerification {}
 
-#[cfg(feature = "native")]
+#[cfg(not(target_arch = "wasm32"))]
 impl rustls::ServerCertVerifier for NoCertificateVerification {
     fn verify_server_cert(
         &self,
@@ -172,7 +181,7 @@ pub type UtxoRpcRes<T> = Box<dyn Future<Item = T, Error = String> + Send + 'stat
 
 /// Common operations that both types of UTXO clients have but implement them differently
 pub trait UtxoRpcClientOps: fmt::Debug + Send + Sync + 'static {
-    fn list_unspent(&self, address: &Address) -> UtxoRpcRes<Vec<UnspentInfo>>;
+    fn list_unspent(&self, address: &Address, decimals: u8) -> UtxoRpcRes<Vec<UnspentInfo>>;
 
     fn send_transaction(&self, tx: &UtxoTx) -> UtxoRpcRes<H256Json>;
 
@@ -192,6 +201,7 @@ pub trait UtxoRpcClientOps: fmt::Debug + Send + Sync + 'static {
         decimals: u8,
         fee_method: &EstimateFeeMethod,
         mode: &Option<EstimateFeeMode>,
+        n_blocks: u32,
     ) -> RpcRes<u64>;
 
     fn get_relay_fee(&self) -> RpcRes<BigDecimal>;
@@ -348,6 +358,54 @@ pub enum EstimateFeeMethod {
     SmartFee,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum BlockNonce {
+    String(String),
+    U64(u64),
+}
+
+#[derive(Debug, Deserialize)]
+pub struct VerboseBlock {
+    /// Block hash
+    pub hash: H256Json,
+    /// Number of confirmations. -1 if block is on the side chain
+    pub confirmations: i64,
+    /// Block size
+    pub size: u32,
+    /// Block size, excluding witness data
+    pub strippedsize: Option<u32>,
+    /// Block weight
+    pub weight: Option<u32>,
+    /// Block height
+    pub height: Option<u32>,
+    /// Block version
+    pub version: u32,
+    /// Block version as hex
+    #[serde(rename = "versionHex")]
+    pub version_hex: Option<String>,
+    /// Merkle root of this block
+    pub merkleroot: H256Json,
+    /// Transactions ids
+    pub tx: Vec<H256Json>,
+    /// Block time in seconds since epoch (Jan 1 1970 GMT)
+    pub time: u32,
+    /// Median block time in seconds since epoch (Jan 1 1970 GMT)
+    pub mediantime: Option<u32>,
+    /// Block nonce
+    pub nonce: BlockNonce,
+    /// Block nbits
+    pub bits: String,
+    /// Block difficulty
+    pub difficulty: f64,
+    /// Expected number of hashes required to produce the chain up to this block (in hex)
+    pub chainwork: H256Json,
+    /// Hash of previous block
+    pub previousblockhash: Option<H256Json>,
+    /// Hash of next block
+    pub nextblockhash: Option<H256Json>,
+}
+
 pub type RpcReqSub<T> = async_oneshot::Sender<Result<T, JsonRpcError>>;
 
 /// RPC client for UTXO based coins
@@ -367,8 +425,6 @@ pub struct NativeClientImpl {
     pub request_id: AtomicU64,
     pub list_unspent_in_progress: AtomicBool,
     pub list_unspent_subs: AsyncMutex<Vec<RpcReqSub<Vec<NativeUnspent>>>>,
-    /// coin decimals used to convert the decimal amount returned from daemon to correct satoshis amount
-    pub coin_decimals: u8,
 }
 
 #[cfg(test)]
@@ -382,7 +438,6 @@ impl Default for NativeClientImpl {
             request_id: Default::default(),
             list_unspent_in_progress: Default::default(),
             list_unspent_subs: Default::default(),
-            coin_decimals: 8,
         }
     }
 }
@@ -454,8 +509,7 @@ impl JsonRpcClient for NativeClientImpl {
 
 #[cfg_attr(test, mockable)]
 impl UtxoRpcClientOps for NativeClient {
-    fn list_unspent(&self, address: &Address) -> UtxoRpcRes<Vec<UnspentInfo>> {
-        let decimals = self.coin_decimals;
+    fn list_unspent(&self, address: &Address, decimals: u8) -> UtxoRpcRes<Vec<UnspentInfo>> {
         let fut = self
             .list_unspent_impl(0, std::i32::MAX, vec![address.to_string()])
             .map_err(|e| ERRL!("{}", e))
@@ -510,16 +564,17 @@ impl UtxoRpcClientOps for NativeClient {
         decimals: u8,
         fee_method: &EstimateFeeMethod,
         mode: &Option<EstimateFeeMode>,
+        n_blocks: u32,
     ) -> RpcRes<u64> {
         match fee_method {
-            EstimateFeeMethod::Standard => Box::new(self.estimate_fee().map(move |fee| {
+            EstimateFeeMethod::Standard => Box::new(self.estimate_fee(n_blocks).map(move |fee| {
                 if fee > 0.00001 {
                     (fee * 10.0_f64.powf(decimals as f64)) as u64
                 } else {
                     1000
                 }
             })),
-            EstimateFeeMethod::SmartFee => Box::new(self.estimate_smart_fee(mode).map(move |res| {
+            EstimateFeeMethod::SmartFee => Box::new(self.estimate_smart_fee(mode, n_blocks).map(move |res| {
                 if res.fee_rate > 0.00001 {
                     (res.fee_rate * 10.0_f64.powf(decimals as f64)) as u64
                 } else {
@@ -569,7 +624,8 @@ impl UtxoRpcClientOps for NativeClient {
     ) -> Box<dyn Future<Item = u32, Error = String> + Send> {
         let selfi = self.clone();
         let fut = async move {
-            let starting_block_data = try_s!(selfi.get_block(starting_block.to_string()).compat().await);
+            let starting_block_hash = try_s!(selfi.get_block_hash(starting_block).compat().await);
+            let starting_block_data = try_s!(selfi.get_block(starting_block_hash).compat().await);
             if let Some(median) = starting_block_data.mediantime {
                 return Ok(median);
             }
@@ -581,7 +637,8 @@ impl UtxoRpcClientOps for NativeClient {
                 starting_block - count.get() + 1
             };
             for block_n in from..starting_block {
-                let block_data = try_s!(selfi.get_block(block_n.to_string()).compat().await);
+                let block_hash = try_s!(selfi.get_block_hash(block_n).compat().await);
+                let block_data = try_s!(selfi.get_block(block_hash).compat().await);
                 block_timestamps.push(block_data.time);
             }
             // can unwrap because count is non zero
@@ -655,10 +712,13 @@ impl NativeClientImpl {
 
     /// https://developer.bitcoin.org/reference/rpc/getblock.html
     /// Always returns verbose block
-    pub fn get_block(&self, height: String) -> RpcRes<VerboseBlockClient> {
+    pub fn get_block(&self, hash: H256Json) -> RpcRes<VerboseBlock> {
         let verbose = true;
-        rpc_func!(self, "getblock", height, verbose)
+        rpc_func!(self, "getblock", hash, verbose)
     }
+
+    /// https://developer.bitcoin.org/reference/rpc/getblockhash.html
+    pub fn get_block_hash(&self, height: u64) -> RpcRes<H256Json> { rpc_func!(self, "getblockhash", height) }
 
     /// https://developer.bitcoin.org/reference/rpc/getblockcount.html
     pub fn get_block_count(&self) -> RpcRes<u64> { rpc_func!(self, "getblockcount") }
@@ -678,16 +738,16 @@ impl NativeClientImpl {
     }
 
     /// https://developer.bitcoin.org/reference/rpc/estimatefee.html
-    /// Always estimate fee for transaction to be confirmed in next block
-    fn estimate_fee(&self) -> RpcRes<f64> {
-        let n_blocks = 1;
-        rpc_func!(self, "estimatefee", n_blocks)
-    }
+    /// It is recommended to set n_blocks as low as possible.
+    /// However, in some cases, n_blocks = 1 leads to an unreasonably high fee estimation.
+    /// https://github.com/KomodoPlatform/atomicDEX-API/issues/656#issuecomment-743759659
+    fn estimate_fee(&self, n_blocks: u32) -> RpcRes<f64> { rpc_func!(self, "estimatefee", n_blocks) }
 
     /// https://developer.bitcoin.org/reference/rpc/estimatesmartfee.html
-    /// Always estimate fee for transaction to be confirmed in next block
-    pub fn estimate_smart_fee(&self, mode: &Option<EstimateFeeMode>) -> RpcRes<EstimateSmartFeeRes> {
-        let n_blocks = 1;
+    /// It is recommended to set n_blocks as low as possible.
+    /// However, in some cases, n_blocks = 1 leads to an unreasonably high fee estimation.
+    /// https://github.com/KomodoPlatform/atomicDEX-API/issues/656#issuecomment-743759659
+    pub fn estimate_smart_fee(&self, mode: &Option<EstimateFeeMode>, n_blocks: u32) -> RpcRes<EstimateSmartFeeRes> {
         match mode {
             Some(m) => rpc_func!(self, "estimatesmartfee", n_blocks, m),
             None => rpc_func!(self, "estimatesmartfee", n_blocks),
@@ -718,8 +778,8 @@ impl NativeClientImpl {
     }
 
     pub fn detect_fee_method(&self) -> impl Future<Item = EstimateFeeMethod, Error = String> + Send {
-        let estimate_fee_fut = self.estimate_fee();
-        self.estimate_smart_fee(&None).then(move |res| -> Box<dyn Future<Item=EstimateFeeMethod, Error=String> + Send> {
+        let estimate_fee_fut = self.estimate_fee(1);
+        self.estimate_smart_fee(&None, 1).then(move |res| -> Box<dyn Future<Item=EstimateFeeMethod, Error=String> + Send> {
             match res {
                 Ok(smart_fee) => if smart_fee.fee_rate > 0. {
                     Box::new(futures01::future::ok(EstimateFeeMethod::SmartFee))
@@ -757,14 +817,15 @@ impl NativeClientImpl {
         )
     }
 
-    /// https://developer.bitcoin.org/reference/rpc/getblockhash.html
-    pub fn get_block_hash(&self, block_number: u64) -> RpcRes<H256Json> {
-        rpc_func!(self, "getblockhash", block_number)
-    }
-
     /// https://developer.bitcoin.org/reference/rpc/sendtoaddress.html
     pub fn send_to_address(&self, addr: &str, amount: &BigDecimal) -> RpcRes<H256Json> {
         rpc_func!(self, "sendtoaddress", addr, amount)
+    }
+
+    /// Returns the list of addresses assigned the specified label.
+    /// https://developer.bitcoin.org/reference/rpc/getaddressesbylabel.html
+    pub fn get_addresses_by_label(&self, label: &str) -> RpcRes<AddressesByLabelResult> {
+        rpc_func!(self, "getaddressesbylabel", label)
     }
 
     /// https://developer.bitcoin.org/reference/rpc/getnetworkinfo.html
@@ -931,7 +992,7 @@ fn addr_to_socket_addr(input: &str) -> Result<SocketAddr, String> {
 }
 
 /// Attempts to process the request (parse url, etc), build up the config and create new electrum connection
-#[cfg(feature = "native")]
+#[cfg(not(target_arch = "wasm32"))]
 pub fn spawn_electrum(
     req: &ElectrumRpcRequest,
     event_handlers: Vec<RpcTransportEventHandlerShared>,
@@ -942,13 +1003,13 @@ pub fn spawn_electrum(
             let uri: Uri = try_s!(req.url.parse());
             let host = try_s!(uri.host().ok_or(ERRL!("Couldn't retrieve host from addr {}", req.url)));
 
-            #[cfg(feature = "native")]
+            #[cfg(not(target_arch = "wasm32"))]
             fn check(host: &str) -> Result<(), String> {
                 DNSNameRef::try_from_ascii_str(host)
                     .map(|_| ())
                     .map_err(|e| fomat!([e]))
             }
-            #[cfg(not(feature = "native"))]
+            #[cfg(target_arch = "wasm32")]
             fn check(_host: &str) -> Result<(), String> { Ok(()) }
 
             try_s!(check(host));
@@ -963,8 +1024,8 @@ pub fn spawn_electrum(
     Ok(electrum_connect(req.url.clone(), config, event_handlers))
 }
 
-#[cfg(not(feature = "native"))]
-#[cfg_attr(feature = "w-bindgen", wasm_bindgen(raw_module = "../../../js/defined-in-js.js"))]
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen(raw_module = "../../../js/defined-in-js.js")]
 extern "C" {
     fn host_electrum_connect(ptr: *const c_char, len: i32) -> i32;
     fn host_electrum_is_connected(ri: i32) -> i32;
@@ -972,21 +1033,21 @@ extern "C" {
     fn host_electrum_reply(ri: i32, id: i32, rbuf: *mut c_char, rcap: i32) -> i32;
 }
 
-#[cfg(not(feature = "native"))]
+#[cfg(target_arch = "wasm32")]
 pub fn spawn_electrum(
     req: &ElectrumRpcRequest,
     _event_handlers: Vec<RpcTransportEventHandlerShared>,
 ) -> Result<ElectrumConnection, String> {
     use std::net::{IpAddr, Ipv4Addr};
 
-    let args = unwrap!(json::to_vec(req));
-    let rc = unsafe { host_electrum_connect(args.as_ptr() as *const c_char, args.len() as i32) };
+    let args = json::to_vec(req).unwrap();
+    let rc = host_electrum_connect(args.as_ptr() as *const c_char, args.len() as i32);
     if rc < 0 {
         panic!("!host_electrum_connect: {}", rc)
     }
     let ri = rc; // Random ID assigned by the host to connection.
 
-    let responses = Arc::new(Mutex::new(HashMap::new()));
+    let responses = Arc::new(AsyncMutex::new(HashMap::new()));
     let tx = Arc::new(AsyncMutex::new(None));
 
     let config = match req.protocol {
@@ -1032,12 +1093,12 @@ pub struct ElectrumConnection {
 }
 
 impl ElectrumConnection {
-    #[cfg(feature = "native")]
+    #[cfg(not(target_arch = "wasm32"))]
     async fn is_connected(&self) -> bool { self.tx.lock().await.is_some() }
 
-    #[cfg(not(feature = "native"))]
+    #[cfg(target_arch = "wasm32")]
     async fn is_connected(&self) -> bool {
-        let rc = unsafe { host_electrum_is_connected(self.ri) };
+        let rc = host_electrum_is_connected(self.ri);
         if rc < 0 {
             panic!("!host_electrum_is_connected: {}", rc)
         }
@@ -1101,7 +1162,7 @@ pub struct ElectrumClientImpl {
     get_balance_subs: AsyncMutex<Vec<async_oneshot::Sender<Result<ElectrumBalance, JsonRpcError>>>>,
 }
 
-#[cfg(feature = "native")]
+#[cfg(not(target_arch = "wasm32"))]
 async fn electrum_request_multi(
     client: ElectrumClient,
     request: JsonRpcRequest,
@@ -1140,7 +1201,7 @@ async fn electrum_request_multi(
     }
 }
 
-#[cfg(feature = "native")]
+#[cfg(not(target_arch = "wasm32"))]
 async fn electrum_request_to(
     client: ElectrumClient,
     request: JsonRpcRequest,
@@ -1166,16 +1227,26 @@ async fn electrum_request_to(
     Ok((JsonRpcRemoteAddr(to_addr.to_owned()), response))
 }
 
-#[cfg(not(feature = "native"))]
+#[cfg(target_arch = "wasm32")]
+async fn electrum_request_to(
+    _client: ElectrumClient,
+    _request: JsonRpcRequest,
+    _to_addr: String,
+) -> Result<(JsonRpcRemoteAddr, JsonRpcResponse), String> {
+    ERR!("Not supported")
+}
+
+#[cfg(target_arch = "wasm32")]
 lazy_static! {
-    static ref ELECTRUM_REPLIES: Mutex<HashMap<(i32, i32), ShotSender<()>>> = Mutex::new(HashMap::new());
+    static ref ELECTRUM_REPLIES: std::sync::Mutex<HashMap<(i32, i32), ShotSender<()>>> =
+        std::sync::Mutex::new(HashMap::new());
 }
 
 #[no_mangle]
-#[cfg(not(feature = "native"))]
+#[cfg(target_arch = "wasm32")]
 pub extern "C" fn electrum_replied(ri: i32, id: i32) {
     //log! ("electrum_replied] " [=ri] ", " [=id]);
-    let mut electrum_replies = unwrap!(ELECTRUM_REPLIES.lock());
+    let mut electrum_replies = ELECTRUM_REPLIES.lock().unwrap();
     if let Some(tx) = electrum_replies.remove(&(ri, id)) {
         let _ = tx.send(());
     }
@@ -1183,7 +1254,7 @@ pub extern "C" fn electrum_replied(ri: i32, id: i32) {
 
 /// AG: As of now the pings tend to fail.
 ///     I haven't looked into this because we'll probably use a websocket or Java implementation instead.
-#[cfg(not(feature = "native"))]
+#[cfg(target_arch = "wasm32")]
 async fn electrum_request_multi(
     client: ElectrumClient,
     request: JsonRpcRequest,
@@ -1202,7 +1273,7 @@ async fn electrum_request_multi(
     for connection in client.connections.lock().await.iter() {
         let (tx, rx) = futures::channel::oneshot::channel();
         try_s!(ELECTRUM_REPLIES.lock()).insert((connection.ri, id), tx);
-        let rc = unsafe { host_electrum_request(connection.ri, req.as_ptr() as *const c_char, req.len() as i32) };
+        let rc = host_electrum_request(connection.ri, req.as_ptr() as *const c_char, req.len() as i32);
         if rc != 0 {
             return ERR!("!host_electrum_request: {}", rc);
         }
@@ -1219,7 +1290,7 @@ async fn electrum_request_multi(
         };
 
         let mut buf: [u8; 131072] = unsafe { MaybeUninit::uninit().assume_init() };
-        let rc = unsafe { host_electrum_reply(connection.ri, id, buf.as_mut_ptr() as *mut c_char, buf.len() as i32) };
+        let rc = host_electrum_reply(connection.ri, id, buf.as_mut_ptr() as *mut c_char, buf.len() as i32);
         if rc <= 0 {
             log!("!host_electrum_reply: "(rc));
             continue;
@@ -1440,9 +1511,10 @@ impl ElectrumClient {
     }
 
     /// https://electrumx.readthedocs.io/en/latest/protocol-methods.html#blockchain-estimatefee
-    /// Always estimate fee for transaction to be confirmed in next block
-    fn estimate_fee(&self, mode: &Option<EstimateFeeMode>) -> RpcRes<f64> {
-        let n_blocks = 1;
+    /// It is recommended to set n_blocks as low as possible.
+    /// However, in some cases, n_blocks = 1 leads to an unreasonably high fee estimation.
+    /// https://github.com/KomodoPlatform/atomicDEX-API/issues/656#issuecomment-743759659
+    fn estimate_fee(&self, mode: &Option<EstimateFeeMode>, n_blocks: u32) -> RpcRes<f64> {
         match mode {
             Some(m) => rpc_func!(self, "blockchain.estimatefee", n_blocks, m),
             None => rpc_func!(self, "blockchain.estimatefee", n_blocks),
@@ -1457,7 +1529,7 @@ impl ElectrumClient {
 
 #[cfg_attr(test, mockable)]
 impl UtxoRpcClientOps for ElectrumClient {
-    fn list_unspent(&self, address: &Address) -> UtxoRpcRes<Vec<UnspentInfo>> {
+    fn list_unspent(&self, address: &Address, _decimals: u8) -> UtxoRpcRes<Vec<UnspentInfo>> {
         let script = Builder::build_p2pkh(&address.hash);
         let script_hash = electrum_script_hash(&script);
         Box::new(
@@ -1515,8 +1587,9 @@ impl UtxoRpcClientOps for ElectrumClient {
         decimals: u8,
         _fee_method: &EstimateFeeMethod,
         mode: &Option<EstimateFeeMode>,
+        n_blocks: u32,
     ) -> RpcRes<u64> {
-        Box::new(self.estimate_fee(mode).map(move |fee| {
+        Box::new(self.estimate_fee(mode, n_blocks).map(move |fee| {
             if fee > 0.00001 {
                 (fee * 10.0_f64.powf(decimals as f64)) as u64
             } else {
@@ -1709,14 +1782,14 @@ macro_rules! try_loop {
 }
 
 /// The enum wrapping possible variants of underlying Streams
-#[cfg(feature = "native")]
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(clippy::large_enum_variant)]
 enum ElectrumStream {
     Tcp(TcpStream),
     Tls(TlsStream<TcpStream>),
 }
 
-#[cfg(feature = "native")]
+#[cfg(not(target_arch = "wasm32"))]
 impl AsRef<TcpStream> for ElectrumStream {
     fn as_ref(&self) -> &TcpStream {
         match self {
@@ -1726,6 +1799,7 @@ impl AsRef<TcpStream> for ElectrumStream {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl AsyncRead for ElectrumStream {
     fn poll_read(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &mut [u8]) -> Poll<io::Result<usize>> {
         match self.get_mut() {
@@ -1735,6 +1809,7 @@ impl AsyncRead for ElectrumStream {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 impl AsyncWrite for ElectrumStream {
     fn poll_write(self: Pin<&mut Self>, cx: &mut Context<'_>, buf: &[u8]) -> Poll<io::Result<usize>> {
         match self.get_mut() {
@@ -1771,7 +1846,7 @@ async fn electrum_last_chunk_loop(last_chunk: Arc<AtomicU64>) {
     }
 }
 
-#[cfg(feature = "native")]
+#[cfg(not(target_arch = "wasm32"))]
 async fn connect_loop(
     config: ElectrumConfig,
     addr: String,
@@ -1805,7 +1880,9 @@ async fn connect_loop(
 
                 Either::Right(TcpStream::connect(&socket_addr).and_then(move |stream| {
                     // Can use `unwrap` cause `dns_name` is pre-checked.
-                    let dns = unwrap!(DNSNameRef::try_from_ascii_str(&dns_name).map_err(|e| fomat!([e])));
+                    let dns = DNSNameRef::try_from_ascii_str(&dns_name)
+                        .map_err(|e| fomat!([e]))
+                        .unwrap();
                     tls_connector.connect(dns, stream).map_ok(ElectrumStream::Tls)
                 }))
             },
@@ -1883,11 +1960,11 @@ async fn connect_loop(
     }
 }
 
-#[cfg(not(feature = "native"))]
+#[cfg(target_arch = "wasm32")]
 async fn connect_loop(
     _config: ElectrumConfig,
     _addr: SocketAddr,
-    _responses: Arc<Mutex<HashMap<String, JsonRpcResponse>>>,
+    _responses: Arc<AsyncMutex<HashMap<String, JsonRpcResponse>>>,
     _connection_tx: Arc<AsyncMutex<Option<mpsc::Sender<Vec<u8>>>>>,
 ) -> Result<(), ()> {
     unimplemented!()
@@ -1895,7 +1972,7 @@ async fn connect_loop(
 
 /// Builds up the electrum connection, spawns endless loop that attempts to reconnect to the server
 /// in case of connection errors
-#[cfg(feature = "native")]
+#[cfg(not(target_arch = "wasm32"))]
 fn electrum_connect(
     addr: String,
     config: ElectrumConfig,
@@ -1926,7 +2003,7 @@ fn electrum_connect(
     }
 }
 
-#[cfg(not(feature = "native"))]
+#[cfg(target_arch = "wasm32")]
 fn electrum_connect(
     _addr: SocketAddr,
     _config: ElectrumConfig,
