@@ -19,8 +19,7 @@ use rpc::v1::types::{H256 as H256Json};
 
 use coins::MmCoinEnum::UtxoCoin;
 use coins::utxo::utxo_standard::UtxoStandardCoin;
-use coins::utxo_common::UtxoTx;
-use coins::utxo::FeePolicy;
+use coins::utxo::{UtxoTx, FeePolicy};
 
 use serialization::{deserialize, Deserializable, Reader, Serializable, Stream};
 use serialization::bytes::Bytes;
