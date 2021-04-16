@@ -183,6 +183,8 @@ pub type UtxoRpcRes<T> = Box<dyn Future<Item = T, Error = String> + Send + 'stat
 pub trait UtxoRpcClientOps: fmt::Debug + Send + Sync + 'static {
     fn list_unspent(&self, address: &Address, decimals: u8) -> UtxoRpcRes<Vec<UnspentInfo>>;
 
+    fn list_unspent_any(&self, script: &[u8], decimals: u8) -> UtxoRpcRes<Vec<UnspentInfo>>;
+
     fn send_transaction(&self, tx: &UtxoTx) -> UtxoRpcRes<H256Json>;
 
     fn send_raw_transaction(&self, tx: BytesJson) -> RpcRes<H256Json>;
@@ -531,6 +533,8 @@ impl UtxoRpcClientOps for NativeClient {
             });
         Box::new(fut)
     }
+
+    fn list_unspent_any(&self, _script: &[u8], _decimals: u8) -> UtxoRpcRes<Vec<UnspentInfo>> { unimplemented!() }
 
     fn send_transaction(&self, tx: &UtxoTx) -> UtxoRpcRes<H256Json> {
         let tx_bytes = BytesJson::from(serialize(tx));
@@ -1531,6 +1535,28 @@ impl ElectrumClient {
 impl UtxoRpcClientOps for ElectrumClient {
     fn list_unspent(&self, address: &Address, _decimals: u8) -> UtxoRpcRes<Vec<UnspentInfo>> {
         let script = Builder::build_p2pkh(&address.hash);
+        let script_hash = electrum_script_hash(&script);
+        Box::new(
+            self.scripthash_list_unspent(&hex::encode(script_hash))
+                .map_err(|e| ERRL!("{}", e))
+                .map(move |unspents| {
+                    unspents
+                        .iter()
+                        .map(|unspent| UnspentInfo {
+                            outpoint: OutPoint {
+                                hash: unspent.tx_hash.reversed().into(),
+                                index: unspent.tx_pos,
+                            },
+                            value: unspent.value,
+                            height: unspent.height,
+                        })
+                        .collect()
+                }),
+        )
+    }
+
+    // neccesary for CC scripts or other nonstandard
+    fn list_unspent_any(&self, script: &[u8], _decimals: u8) -> UtxoRpcRes<Vec<UnspentInfo>> {
         let script_hash = electrum_script_hash(&script);
         Box::new(
             self.scripthash_list_unspent(&hex::encode(script_hash))
