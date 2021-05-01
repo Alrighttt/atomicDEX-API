@@ -21,8 +21,8 @@ doctest = false
 bench = false
 
 [[bin]]
-name = "docker_tests"
-path = "mm2src/docker_tests.rs"
+name = "alright_tests"
+path = "mm2src/alright_tests.rs"
 
 [lib]
 name = "mm2"

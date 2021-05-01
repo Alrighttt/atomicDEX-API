@@ -2439,7 +2439,7 @@ where
     Ok(result)
 }
 
-fn payment_script(time_lock: u32, secret_hash: &[u8], pub_0: &Public, pub_1: &Public) -> Script {
+pub fn payment_script(time_lock: u32, secret_hash: &[u8], pub_0: &Public, pub_1: &Public) -> Script {
     let builder = Builder::default();
     builder
         .push_opcode(Opcode::OP_IF)
@@ -2462,7 +2462,7 @@ fn payment_script(time_lock: u32, secret_hash: &[u8], pub_0: &Public, pub_1: &Pu
 }
 
 /// Creates signed input spending hash time locked p2sh output
-fn p2sh_spend(
+pub fn p2sh_spend(
     signer: &TransactionInputSigner,
     input_index: usize,
     key_pair: &KeyPair,

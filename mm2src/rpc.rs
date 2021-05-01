@@ -42,12 +42,12 @@ use crate::mm2::lp_swap::{active_swaps_rpc, all_swaps_uuids_by_filter, coins_nee
                           stats_swap_status, trade_preimage, unban_pubkeys};
 
 use self::lp_commands::*;
-use self::cc_token_rpc::tokens_router;
+use self::ztools_rpc::z_router;
 
 
 #[path = "rpc/lp_commands.rs"] pub mod lp_commands;
 
-#[path = "rpc/cc_token_rpc.rs"] pub mod cc_token_rpc;
+#[path = "rpc/ztools_rpc.rs"] pub mod ztools_rpc;
 
 /// Lists the RPC method not requiring the "userpass" authentication.  
 /// None is also public to skip auth and display proper error in case of method is missing
@@ -190,7 +190,7 @@ pub fn dispatcher(req: Json, ctx: MmArc) -> DispatcherRes {
         "validateaddress" => hyres(validate_address(ctx, req)),
         "version" => version(),
         "withdraw" => hyres(withdraw(ctx, req)),
-        "tokens" => hyres(tokens_router(ctx, req)),
+        "ztools" => hyres(z_router(ctx, req)),
         _ => return DispatcherRes::NoMatch(req),
     })
 }
