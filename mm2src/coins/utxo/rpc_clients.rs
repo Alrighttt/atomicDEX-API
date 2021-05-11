@@ -3,16 +3,19 @@
 #![cfg_attr(target_arch = "wasm32", allow(dead_code))]
 
 use crate::utxo::sat_from_big_decimal;
-use crate::{RpcTransportEventHandler, RpcTransportEventHandlerShared};
+use crate::{NumConversError, RpcTransportEventHandler, RpcTransportEventHandlerShared};
 use bigdecimal::BigDecimal;
 use chain::{BlockHeader, OutPoint, Transaction as UtxoTx};
 use common::custom_futures::select_ok_sequential;
 use common::executor::{spawn, Timer};
-use common::jsonrpc_client::{JsonRpcClient, JsonRpcError, JsonRpcMultiClient, JsonRpcRemoteAddr, JsonRpcRequest,
-                             JsonRpcResponse, JsonRpcResponseFut, RpcRes};
+use common::jsonrpc_client::{JsonRpcClient, JsonRpcError, JsonRpcErrorType, JsonRpcMultiClient, JsonRpcRemoteAddr,
+                             JsonRpcRequest, JsonRpcResponse, JsonRpcResponseFut, RpcRes};
+use common::log::warn;
+use common::mm_error::prelude::*;
 use common::mm_number::MmNumber;
 use common::wio::slurp_req;
 use common::{median, OrdRange, StringError};
+use derive_more::Display;
 use futures::channel::oneshot as async_oneshot;
 #[cfg(target_arch = "wasm32")]
 use futures::channel::oneshot::Sender as ShotSender;
@@ -45,7 +48,7 @@ use std::num::NonZeroU64;
 use std::ops::Deref;
 #[cfg(target_arch = "wasm32")] use std::os::raw::c_char;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -177,17 +180,43 @@ pub struct UnspentInfo {
     pub height: Option<u64>,
 }
 
-pub type UtxoRpcRes<T> = Box<dyn Future<Item = T, Error = String> + Send + 'static>;
+pub type UtxoRpcResult<T> = Result<T, MmError<UtxoRpcError>>;
+pub type UtxoRpcFut<T> = Box<dyn Future<Item = T, Error = MmError<UtxoRpcError>> + Send + 'static>;
+
+#[derive(Debug, Display)]
+pub enum UtxoRpcError {
+    Transport(JsonRpcError),
+    ResponseParseError(JsonRpcError),
+    InvalidResponse(String),
+    Internal(String),
+}
+
+impl From<JsonRpcError> for UtxoRpcError {
+    fn from(e: JsonRpcError) -> Self {
+        match e.error {
+            JsonRpcErrorType::Transport(_) => UtxoRpcError::Transport(e),
+            JsonRpcErrorType::Parse(_, _) | JsonRpcErrorType::Response(_, _) => UtxoRpcError::ResponseParseError(e),
+        }
+    }
+}
+
+impl From<serialization::Error> for UtxoRpcError {
+    fn from(e: serialization::Error) -> Self { UtxoRpcError::InvalidResponse(format!("{:?}", e)) }
+}
+
+impl From<NumConversError> for UtxoRpcError {
+    fn from(e: NumConversError) -> Self { UtxoRpcError::Internal(e.to_string()) }
+}
 
 /// Common operations that both types of UTXO clients have but implement them differently
 pub trait UtxoRpcClientOps: fmt::Debug + Send + Sync + 'static {
-    fn list_unspent(&self, address: &Address, decimals: u8) -> UtxoRpcRes<Vec<UnspentInfo>>;
+    fn list_unspent(&self, address: &Address, decimals: u8) -> UtxoRpcFut<Vec<UnspentInfo>>;
 
-    fn send_transaction(&self, tx: &UtxoTx) -> UtxoRpcRes<H256Json>;
+    fn send_transaction(&self, tx: &UtxoTx) -> Box<dyn Future<Item = H256Json, Error = String> + Send + 'static>;
 
     fn send_raw_transaction(&self, tx: BytesJson) -> RpcRes<H256Json>;
 
-    fn get_transaction_bytes(&self, txid: H256Json) -> RpcRes<BytesJson>;
+    fn get_transaction_bytes(&self, txid: H256Json) -> UtxoRpcFut<BytesJson>;
 
     fn get_verbose_transaction(&self, txid: H256Json) -> RpcRes<RpcTransaction>;
 
@@ -214,11 +243,7 @@ pub trait UtxoRpcClientOps: fmt::Debug + Send + Sync + 'static {
     ) -> Box<dyn Future<Item = Option<UtxoTx>, Error = String> + Send>;
 
     /// Get median time past for `count` blocks in the past including `starting_block`
-    fn get_median_time_past(
-        &self,
-        starting_block: u64,
-        count: NonZeroU64,
-    ) -> Box<dyn Future<Item = u32, Error = String> + Send>;
+    fn get_median_time_past(&self, starting_block: u64, count: NonZeroU64) -> UtxoRpcFut<u32>;
 }
 
 #[derive(Clone, Deserialize, Debug)]
@@ -408,6 +433,13 @@ pub struct VerboseBlock {
 
 pub type RpcReqSub<T> = async_oneshot::Sender<Result<T, JsonRpcError>>;
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ListUnspentArgs {
+    min_conf: i32,
+    max_conf: i32,
+    addresses: Vec<String>,
+}
+
 /// RPC client for UTXO based coins
 /// https://developer.bitcoin.org/reference/rpc/index.html - Bitcoin RPC API reference
 /// Other coins have additional methods or miss some of these
@@ -423,8 +455,7 @@ pub struct NativeClientImpl {
     /// Transport event handlers
     pub event_handlers: Vec<RpcTransportEventHandlerShared>,
     pub request_id: AtomicU64,
-    pub list_unspent_in_progress: AtomicBool,
-    pub list_unspent_subs: AsyncMutex<Vec<RpcReqSub<Vec<NativeUnspent>>>>,
+    pub list_unspent_concurrent_map: ConcurrentRequestMap<ListUnspentArgs, Vec<NativeUnspent>>,
 }
 
 #[cfg(test)]
@@ -436,8 +467,7 @@ impl Default for NativeClientImpl {
             auth: "".to_string(),
             event_handlers: vec![],
             request_id: Default::default(),
-            list_unspent_in_progress: Default::default(),
-            list_unspent_subs: Default::default(),
+            list_unspent_concurrent_map: ConcurrentRequestMap::new(),
         }
     }
 }
@@ -509,12 +539,12 @@ impl JsonRpcClient for NativeClientImpl {
 
 #[cfg_attr(test, mockable)]
 impl UtxoRpcClientOps for NativeClient {
-    fn list_unspent(&self, address: &Address, decimals: u8) -> UtxoRpcRes<Vec<UnspentInfo>> {
+    fn list_unspent(&self, address: &Address, decimals: u8) -> UtxoRpcFut<Vec<UnspentInfo>> {
         let fut = self
             .list_unspent_impl(0, std::i32::MAX, vec![address.to_string()])
-            .map_err(|e| ERRL!("{}", e))
+            .map_to_mm_fut(UtxoRpcError::from)
             .and_then(move |unspents| {
-                let unspents: Result<Vec<_>, _> = unspents
+                let unspents: UtxoRpcResult<Vec<_>> = unspents
                     .into_iter()
                     .map(|unspent| {
                         Ok(UnspentInfo {
@@ -522,17 +552,17 @@ impl UtxoRpcClientOps for NativeClient {
                                 hash: unspent.txid.reversed().into(),
                                 index: unspent.vout,
                             },
-                            value: try_s!(sat_from_big_decimal(&unspent.amount.to_decimal(), decimals)),
+                            value: sat_from_big_decimal(&unspent.amount.to_decimal(), decimals)?,
                             height: None,
                         })
                     })
                     .collect();
-                Ok(try_s!(unspents))
+                unspents
             });
         Box::new(fut)
     }
 
-    fn send_transaction(&self, tx: &UtxoTx) -> UtxoRpcRes<H256Json> {
+    fn send_transaction(&self, tx: &UtxoTx) -> Box<dyn Future<Item = H256Json, Error = String> + Send + 'static> {
         let tx_bytes = BytesJson::from(serialize(tx));
         Box::new(self.send_raw_transaction(tx_bytes).map_err(|e| ERRL!("{}", e)))
     }
@@ -540,7 +570,9 @@ impl UtxoRpcClientOps for NativeClient {
     /// https://developer.bitcoin.org/reference/rpc/sendrawtransaction
     fn send_raw_transaction(&self, tx: BytesJson) -> RpcRes<H256Json> { rpc_func!(self, "sendrawtransaction", tx) }
 
-    fn get_transaction_bytes(&self, txid: H256Json) -> RpcRes<BytesJson> { self.get_raw_transaction_bytes(txid) }
+    fn get_transaction_bytes(&self, txid: H256Json) -> UtxoRpcFut<BytesJson> {
+        Box::new(self.get_raw_transaction_bytes(txid).map_to_mm_fut(UtxoRpcError::from))
+    }
 
     fn get_verbose_transaction(&self, txid: H256Json) -> RpcRes<RpcTransaction> {
         self.get_raw_transaction_verbose(txid)
@@ -617,15 +649,11 @@ impl UtxoRpcClientOps for NativeClient {
         Box::new(fut.boxed().compat())
     }
 
-    fn get_median_time_past(
-        &self,
-        starting_block: u64,
-        count: NonZeroU64,
-    ) -> Box<dyn Future<Item = u32, Error = String> + Send> {
+    fn get_median_time_past(&self, starting_block: u64, count: NonZeroU64) -> UtxoRpcFut<u32> {
         let selfi = self.clone();
         let fut = async move {
-            let starting_block_hash = try_s!(selfi.get_block_hash(starting_block).compat().await);
-            let starting_block_data = try_s!(selfi.get_block(starting_block_hash).compat().await);
+            let starting_block_hash = selfi.get_block_hash(starting_block).compat().await?;
+            let starting_block_data = selfi.get_block(starting_block_hash).compat().await?;
             if let Some(median) = starting_block_data.mediantime {
                 return Ok(median);
             }
@@ -637,8 +665,8 @@ impl UtxoRpcClientOps for NativeClient {
                 starting_block - count.get() + 1
             };
             for block_n in from..starting_block {
-                let block_hash = try_s!(selfi.get_block_hash(block_n).compat().await);
-                let block_data = try_s!(selfi.get_block(block_hash).compat().await);
+                let block_hash = selfi.get_block_hash(block_n).compat().await?;
+                let block_data = selfi.get_block(block_hash).compat().await?;
                 block_timestamps.push(block_data.time);
             }
             // can unwrap because count is non zero
@@ -657,32 +685,15 @@ impl NativeClient {
         max_conf: i32,
         addresses: Vec<String>,
     ) -> RpcRes<Vec<NativeUnspent>> {
+        let request_fut = rpc_func!(self, "listunspent", &min_conf, &max_conf, &addresses);
         let arc = self.clone();
-        if self
-            .list_unspent_in_progress
-            .compare_and_swap(false, true, AtomicOrdering::Relaxed)
-        {
-            let fut = async move {
-                let (tx, rx) = async_oneshot::channel();
-                arc.list_unspent_subs.lock().await.push(tx);
-                rx.await.unwrap()
-            };
-            Box::new(fut.boxed().compat())
-        } else {
-            let fut = async move {
-                let unspents_res = rpc_func!(arc, "listunspent", min_conf, max_conf, addresses)
-                    .compat()
-                    .await;
-                for sub in arc.list_unspent_subs.lock().await.drain(..) {
-                    if sub.send(unspents_res.clone()).is_err() {
-                        log!("list_unspent_sub is dropped");
-                    }
-                }
-                arc.list_unspent_in_progress.store(false, AtomicOrdering::Relaxed);
-                unspents_res
-            };
-            Box::new(fut.boxed().compat())
-        }
+        let args = ListUnspentArgs {
+            min_conf,
+            max_conf,
+            addresses,
+        };
+        let fut = async move { arc.list_unspent_concurrent_map.wrap_request(args, request_fut).await };
+        Box::new(fut.boxed().compat())
     }
 }
 
@@ -698,7 +709,11 @@ impl NativeClientImpl {
         rpc_func!(self, "validateaddress", address)
     }
 
-    pub fn output_amount(&self, txid: H256Json, index: usize) -> UtxoRpcRes<u64> {
+    pub fn output_amount(
+        &self,
+        txid: H256Json,
+        index: usize,
+    ) -> Box<dyn Future<Item = u64, Error = String> + Send + 'static> {
         let fut = self.get_raw_transaction_bytes(txid).map_err(|e| ERRL!("{}", e));
         Box::new(fut.and_then(move |bytes| {
             let tx: UtxoTx = try_s!(deserialize(bytes.as_slice()).map_err(|e| ERRL!(
@@ -1124,26 +1139,61 @@ impl Drop for ElectrumConnection {
 }
 
 #[derive(Debug)]
-pub struct RpcRequestState<T> {
-    is_request_running: Arc<AtomicBool>,
-    response_subs: Vec<oneshot::Sender<Result<T, JsonRpcError>>>,
+struct ConcurrentRequestState<V> {
+    is_running: bool,
+    subscribers: Vec<RpcReqSub<V>>,
+}
+
+impl<V> ConcurrentRequestState<V> {
+    fn new() -> Self {
+        ConcurrentRequestState {
+            is_running: false,
+            subscribers: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug)]
-pub struct RpcRequestWrapper<Key, Response> {
-    inner: HashMap<Key, RpcRequestState<Response>>,
+pub struct ConcurrentRequestMap<K, V> {
+    inner: AsyncMutex<HashMap<K, ConcurrentRequestState<V>>>,
 }
 
-impl<Key, Response> RpcRequestWrapper<Key, Response> {
-    fn new() -> Self { RpcRequestWrapper { inner: HashMap::new() } }
+impl<K, V> Default for ConcurrentRequestMap<K, V> {
+    fn default() -> Self {
+        ConcurrentRequestMap {
+            inner: AsyncMutex::new(HashMap::new()),
+        }
+    }
+}
 
-    #[allow(dead_code)]
-    async fn wrap_request(
-        &mut self,
-        _key: Key,
-        _request: impl Future<Item = Response, Error = JsonRpcError>,
-    ) -> Result<Response, JsonRpcError> {
-        unimplemented!()
+impl<K: Clone + Eq + std::hash::Hash, V: Clone> ConcurrentRequestMap<K, V> {
+    pub fn new() -> ConcurrentRequestMap<K, V> { ConcurrentRequestMap::default() }
+
+    async fn wrap_request(&self, request_arg: K, request_fut: RpcRes<V>) -> Result<V, JsonRpcError> {
+        let mut map = self.inner.lock().await;
+        let state = map
+            .entry(request_arg.clone())
+            .or_insert_with(ConcurrentRequestState::new);
+        if state.is_running {
+            let (tx, rx) = async_oneshot::channel();
+            state.subscribers.push(tx);
+            // drop here to avoid holding the lock during await
+            drop(map);
+            rx.await.unwrap()
+        } else {
+            // drop here to avoid holding the lock during await
+            drop(map);
+            let request_res = request_fut.compat().await;
+            let mut map = self.inner.lock().await;
+            let state = map.get_mut(&request_arg).unwrap();
+            for sub in state.subscribers.drain(..) {
+                if sub.send(request_res.clone()).is_err() {
+                    warn!("subscriber is dropped");
+                }
+            }
+            state.is_running = false;
+            request_res
+        }
     }
 }
 
@@ -1154,12 +1204,8 @@ pub struct ElectrumClientImpl {
     next_id: AtomicU64,
     event_handlers: Vec<RpcTransportEventHandlerShared>,
     protocol_version: OrdRange<f32>,
-    get_balance_wrapper: RpcRequestWrapper<Address, ElectrumBalance>,
-    list_unspent_wrapper: RpcRequestWrapper<Address, Vec<ElectrumUnspent>>,
-    list_unspent_in_progress: AtomicBool,
-    list_unspent_subs: AsyncMutex<Vec<RpcReqSub<Vec<ElectrumUnspent>>>>,
-    get_balance_in_progress: AtomicBool,
-    get_balance_subs: AsyncMutex<Vec<async_oneshot::Sender<Result<ElectrumBalance, JsonRpcError>>>>,
+    get_balance_concurrent_map: ConcurrentRequestMap<String, ElectrumBalance>,
+    list_unspent_concurrent_map: ConcurrentRequestMap<String, Vec<ElectrumUnspent>>,
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -1168,17 +1214,24 @@ async fn electrum_request_multi(
     request: JsonRpcRequest,
 ) -> Result<(JsonRpcRemoteAddr, JsonRpcResponse), String> {
     let mut futures = vec![];
-    for connection in client.connections.lock().await.iter() {
+    let connections = client.connections.lock().await;
+    for connection in connections.iter() {
         let connection_addr = connection.addr.clone();
         match &*connection.tx.lock().await {
             Some(tx) => {
-                let fut = electrum_request(request.clone(), tx.clone(), connection.responses.clone())
-                    .map(|response| (JsonRpcRemoteAddr(connection_addr), response));
+                let fut = electrum_request(
+                    request.clone(),
+                    tx.clone(),
+                    connection.responses.clone(),
+                    ELECTRUM_TIMEOUT / connections.len() as u64,
+                )
+                .map(|response| (JsonRpcRemoteAddr(connection_addr), response));
                 futures.push(fut)
             },
             None => (),
         }
     }
+    drop(connections);
     if futures.is_empty() {
         return ERR!("All electrums are currently disconnected");
     }
@@ -1223,7 +1276,11 @@ async fn electrum_request_to(
         (tx, responses)
     };
 
-    let response = try_s!(electrum_request(request.clone(), tx, responses).compat().await);
+    let response = try_s!(
+        electrum_request(request.clone(), tx, responses, ELECTRUM_TIMEOUT)
+            .compat()
+            .await
+    );
     Ok((JsonRpcRemoteAddr(to_addr.to_owned()), response))
 }
 
@@ -1423,47 +1480,26 @@ impl ElectrumClient {
     /// It can return duplicates sometimes: https://github.com/artemii235/SuperNET/issues/269
     /// We should remove them to build valid transactions
     fn scripthash_list_unspent(&self, hash: &str) -> RpcRes<Vec<ElectrumUnspent>> {
+        let request_fut = Box::new(rpc_func!(self, "blockchain.scripthash.listunspent", hash).and_then(
+            move |unspents: Vec<ElectrumUnspent>| {
+                let mut map: HashMap<(H256Json, u32), bool> = HashMap::new();
+                let unspents = unspents
+                    .into_iter()
+                    .filter(|unspent| match map.entry((unspent.tx_hash.clone(), unspent.tx_pos)) {
+                        Entry::Occupied(_) => false,
+                        Entry::Vacant(e) => {
+                            e.insert(true);
+                            true
+                        },
+                    })
+                    .collect();
+                Ok(unspents)
+            },
+        ));
         let arc = self.clone();
         let hash = hash.to_owned();
-        if self
-            .list_unspent_in_progress
-            .compare_and_swap(false, true, AtomicOrdering::Relaxed)
-        {
-            let fut = async move {
-                let (tx, rx) = async_oneshot::channel();
-                arc.list_unspent_subs.lock().await.push(tx);
-                rx.await.unwrap()
-            };
-            Box::new(fut.boxed().compat())
-        } else {
-            let fut = async move {
-                let unspents_res = rpc_func!(arc, "blockchain.scripthash.listunspent", hash)
-                    .and_then(move |unspents: Vec<ElectrumUnspent>| {
-                        let mut map: HashMap<(H256Json, u32), bool> = HashMap::new();
-                        let unspents = unspents
-                            .into_iter()
-                            .filter(|unspent| match map.entry((unspent.tx_hash.clone(), unspent.tx_pos)) {
-                                Entry::Occupied(_) => false,
-                                Entry::Vacant(e) => {
-                                    e.insert(true);
-                                    true
-                                },
-                            })
-                            .collect();
-                        Ok(unspents)
-                    })
-                    .compat()
-                    .await;
-                for sub in arc.list_unspent_subs.lock().await.drain(..) {
-                    if sub.send(unspents_res.clone()).is_err() {
-                        log!("list_unspent_sub is dropped");
-                    }
-                }
-                arc.list_unspent_in_progress.store(false, AtomicOrdering::Relaxed);
-                unspents_res
-            };
-            Box::new(fut.boxed().compat())
-        }
+        let fut = async move { arc.list_unspent_concurrent_map.wrap_request(hash, request_fut).await };
+        Box::new(fut.boxed().compat())
     }
 
     /// https://electrumx.readthedocs.io/en/latest/protocol-methods.html#blockchain-scripthash-get-history
@@ -1475,29 +1511,11 @@ impl ElectrumClient {
     fn scripthash_get_balance(&self, hash: &str) -> RpcRes<ElectrumBalance> {
         let arc = self.clone();
         let hash = hash.to_owned();
-        if self
-            .get_balance_in_progress
-            .compare_and_swap(false, true, AtomicOrdering::Relaxed)
-        {
-            let fut = async move {
-                let (tx, rx) = async_oneshot::channel();
-                arc.get_balance_subs.lock().await.push(tx);
-                rx.await.unwrap()
-            };
-            Box::new(fut.boxed().compat())
-        } else {
-            let fut = async move {
-                let balance_res = rpc_func!(arc, "blockchain.scripthash.get_balance", hash).compat().await;
-                for sub in arc.get_balance_subs.lock().await.drain(..) {
-                    if sub.send(balance_res.clone()).is_err() {
-                        log!("list_unspent_sub is dropped");
-                    }
-                }
-                arc.get_balance_in_progress.store(false, AtomicOrdering::Relaxed);
-                balance_res
-            };
-            Box::new(fut.boxed().compat())
-        }
+        let fut = async move {
+            let request = rpc_func!(arc, "blockchain.scripthash.get_balance", &hash);
+            arc.get_balance_concurrent_map.wrap_request(hash, request).await
+        };
+        Box::new(fut.boxed().compat())
     }
 
     /// https://electrumx.readthedocs.io/en/latest/protocol-methods.html#blockchain-headers-subscribe
@@ -1529,12 +1547,12 @@ impl ElectrumClient {
 
 #[cfg_attr(test, mockable)]
 impl UtxoRpcClientOps for ElectrumClient {
-    fn list_unspent(&self, address: &Address, _decimals: u8) -> UtxoRpcRes<Vec<UnspentInfo>> {
+    fn list_unspent(&self, address: &Address, _decimals: u8) -> UtxoRpcFut<Vec<UnspentInfo>> {
         let script = Builder::build_p2pkh(&address.hash);
         let script_hash = electrum_script_hash(&script);
         Box::new(
             self.scripthash_list_unspent(&hex::encode(script_hash))
-                .map_err(|e| ERRL!("{}", e))
+                .map_to_mm_fut(UtxoRpcError::from)
                 .map(move |unspents| {
                     unspents
                         .iter()
@@ -1551,7 +1569,7 @@ impl UtxoRpcClientOps for ElectrumClient {
         )
     }
 
-    fn send_transaction(&self, tx: &UtxoTx) -> UtxoRpcRes<H256Json> {
+    fn send_transaction(&self, tx: &UtxoTx) -> Box<dyn Future<Item = H256Json, Error = String> + Send + 'static> {
         let bytes = BytesJson::from(serialize(tx));
         Box::new(self.blockchain_transaction_broadcast(bytes).map_err(|e| ERRL!("{}", e)))
     }
@@ -1560,9 +1578,9 @@ impl UtxoRpcClientOps for ElectrumClient {
 
     /// https://electrumx.readthedocs.io/en/latest/protocol-methods.html#blockchain-transaction-get
     /// returns transaction bytes by default
-    fn get_transaction_bytes(&self, txid: H256Json) -> RpcRes<BytesJson> {
+    fn get_transaction_bytes(&self, txid: H256Json) -> UtxoRpcFut<BytesJson> {
         let verbose = false;
-        rpc_func!(self, "blockchain.transaction.get", txid, verbose)
+        Box::new(rpc_func!(self, "blockchain.transaction.get", txid, verbose).map_to_mm_fut(UtxoRpcError::from))
     }
 
     /// https://electrumx.readthedocs.io/en/latest/protocol-methods.html#blockchain-transaction-get
@@ -1632,11 +1650,7 @@ impl UtxoRpcClientOps for ElectrumClient {
         Box::new(fut.boxed().compat())
     }
 
-    fn get_median_time_past(
-        &self,
-        starting_block: u64,
-        count: NonZeroU64,
-    ) -> Box<dyn Future<Item = u32, Error = String> + Send> {
+    fn get_median_time_past(&self, starting_block: u64, count: NonZeroU64) -> UtxoRpcFut<u32> {
         let from = if starting_block <= count.get() {
             0
         } else {
@@ -1644,16 +1658,16 @@ impl UtxoRpcClientOps for ElectrumClient {
         };
         Box::new(
             self.blockchain_block_headers(from, count)
-                .map_err(|e| ERRL!("{}", e))
+                .map_to_mm_fut(UtxoRpcError::from)
                 .and_then(|res| {
                     if res.count == 0 {
-                        return ERR!("Server returned zero count");
+                        return MmError::err(UtxoRpcError::InvalidResponse("Server returned zero count".to_owned()));
                     }
                     let len = CompactInteger::from(res.count);
                     let mut serialized = serialize(&len).take();
                     serialized.extend(res.hex.0.into_iter());
                     let mut reader = Reader::new(serialized.as_slice());
-                    let headers = try_s!(reader.read_list::<BlockHeader>().map_err(|e| ERRL!("{:?}", e)));
+                    let headers = reader.read_list::<BlockHeader>()?;
                     let mut timestamps: Vec<_> = headers.into_iter().map(|block| block.time).collect();
                     // can unwrap because count is non zero
                     Ok(median(timestamps.as_mut_slice()).unwrap())
@@ -1672,12 +1686,8 @@ impl ElectrumClientImpl {
             next_id: 0.into(),
             event_handlers,
             protocol_version,
-            get_balance_wrapper: RpcRequestWrapper::new(),
-            list_unspent_wrapper: RpcRequestWrapper::new(),
-            list_unspent_in_progress: Default::default(),
-            list_unspent_subs: Default::default(),
-            get_balance_in_progress: Default::default(),
-            get_balance_subs: Default::default(),
+            get_balance_concurrent_map: ConcurrentRequestMap::new(),
+            list_unspent_concurrent_map: ConcurrentRequestMap::new(),
         }
     }
 
@@ -2016,6 +2026,7 @@ fn electrum_request(
     request: JsonRpcRequest,
     tx: mpsc::Sender<Vec<u8>>,
     responses: Arc<AsyncMutex<HashMap<String, async_oneshot::Sender<JsonRpcResponse>>>>,
+    timeout: u64,
 ) -> Box<dyn Future<Item = JsonRpcResponse, Error = String> + Send + 'static> {
     let send_fut = async move {
         let mut json = try_s!(json::to_string(&request));
@@ -2033,7 +2044,7 @@ fn electrum_request(
         .boxed()
         .compat()
         .map_err(StringError)
-        .timeout(Duration::from_secs(ELECTRUM_TIMEOUT));
+        .timeout(Duration::from_secs(timeout));
 
     Box::new(send_fut.map_err(|e| ERRL!("{}", e.0)))
 }

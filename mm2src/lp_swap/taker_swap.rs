@@ -1,19 +1,23 @@
-use super::{ban_pubkey, broadcast_my_swap_status, broadcast_swap_message_every, check_my_coin_balance_for_swap,
-            check_other_coin_balance_for_swap, dex_fee_amount_from_taker_coin, dex_fee_rate, dex_fee_threshold,
-            get_locked_amount, my_swap_file_path, my_swaps_dir, recv_swap_msg, swap_topic, AtomicSwap,
-            CheckBalanceError, DetailedTakerFee, DetailedVolume, LockedAmount, MySwapInfo, NegotiationDataMsg,
+use super::check_balance::{check_my_coin_balance_for_swap, CheckBalanceError, CheckBalanceResult,
+                           TakerFeeAdditionalInfo};
+use super::pubkey_banning::ban_pubkey_on_failed_swap;
+use super::trade_preimage::{TradePreimageMethod, TradePreimageRequest, TradePreimageRpcError, TradePreimageRpcResult};
+use super::{broadcast_my_swap_status, broadcast_swap_message_every, check_other_coin_balance_for_swap,
+            dex_fee_amount_from_taker_coin, dex_fee_rate, dex_fee_threshold, get_locked_amount, my_swap_file_path,
+            my_swaps_dir, recv_swap_msg, swap_topic, AtomicSwap, LockedAmount, MySwapInfo, NegotiationDataMsg,
             RecoveredSwap, RecoveredSwapAction, SavedSwap, SavedTradeFee, SwapConfirmationsSettings, SwapError,
-            SwapMsg, SwapsContext, TakerFeeAdditionalInfo, TradeFeeResponse, TradePreimageMethod,
-            TradePreimageRequest, TradePreimageResponse, TransactionIdentifier, WAIT_CONFIRM_INTERVAL};
+            SwapMsg, SwapsContext, TransactionIdentifier, WAIT_CONFIRM_INTERVAL};
 use crate::mm2::lp_network::subscribe_to_topic;
+use crate::mm2::MM_VERSION;
 use atomic::Atomic;
 use bigdecimal::BigDecimal;
 use coins::{lp_coinfind, CanRefundHtlc, FeeApproxStage, FoundSwapTxSpend, MmCoinEnum, TradeFee, TradePreimageValue};
 use common::executor::Timer;
 use common::log::{debug, error, warn};
 use common::mm_ctx::MmArc;
+use common::mm_error::prelude::*;
 use common::mm_number::MmNumber;
-use common::{bits256, file_lock::FileLock, now_ms, slurp, write, Traceable, DEX_FEE_ADDR_RAW_PUBKEY, MM_VERSION};
+use common::{bits256, file_lock::FileLock, now_ms, slurp, write, DEX_FEE_ADDR_RAW_PUBKEY};
 use futures::{compat::Future01CompatExt, select, FutureExt};
 use futures01::Future;
 use http::Response;
@@ -349,7 +353,7 @@ pub async fn run_taker_swap(swap: RunTakerSwapInput, ctx: MmArc) {
 
                     save_my_taker_swap_event(&ctx, &running_swap, to_save).expect("!save_my_taker_swap_event");
                     if event.should_ban_maker() {
-                        ban_pubkey(
+                        ban_pubkey_on_failed_swap(
                             &ctx,
                             running_swap.maker.bytes.into(),
                             &running_swap.uuid,
@@ -528,8 +532,7 @@ impl TakerSwapEvent {
 
     fn should_ban_maker(&self) -> bool {
         matches!(self,
-            TakerSwapEvent::NegotiateFailed(_)
-            | TakerSwapEvent::MakerPaymentValidateFailed(_)
+            TakerSwapEvent::MakerPaymentValidateFailed(_)
             | TakerSwapEvent::TakerPaymentWaitForSpendFailed(_))
     }
 
@@ -673,8 +676,9 @@ impl TakerSwap {
     }
 
     async fn start(&self) -> Result<(Option<TakerSwapCommand>, Vec<TakerSwapEvent>), String> {
+        // do not use self.r().data here as it is not initialized at this step yet
         let stage = FeeApproxStage::StartSwap;
-        let dex_fee = dex_fee_amount_from_taker_coin(&self.taker_coin, &self.r().data.maker_coin, &self.taker_amount);
+        let dex_fee = dex_fee_amount_from_taker_coin(&self.taker_coin, self.maker_coin.ticker(), &self.taker_amount);
         let preimage_value = TradePreimageValue::Exact(self.taker_amount.to_decimal());
 
         let fee_to_send_dex_fee_fut = self
@@ -1518,69 +1522,103 @@ pub async fn check_balance_for_taker_swap(
         )
         .await
     );
-    try_s!(check_other_coin_balance_for_swap(ctx, other_coin, swap_uuid, params.maker_payment_spend_trade_fee).await);
+    if !params.maker_payment_spend_trade_fee.paid_from_trading_vol {
+        try_s!(
+            check_other_coin_balance_for_swap(ctx, other_coin, swap_uuid, params.maker_payment_spend_trade_fee).await
+        );
+    }
     Ok(())
 }
 
+pub struct TakerTradePreimage {
+    /// The fee is paid per swap concerning the `base` coin.
+    pub base_coin_fee: TradeFee,
+    /// The fee is paid per swap concerning the `rel` coin.
+    pub rel_coin_fee: TradeFee,
+    /// The dex fee to be paid by taker coin.
+    pub taker_fee: TradeFee,
+    /// The miner fee is paid to send the dex fee.
+    pub fee_to_send_taker_fee: TradeFee,
+}
+
 pub async fn taker_swap_trade_preimage(
-    ctx: &MmArc,
+    _ctx: &MmArc,
     req: TradePreimageRequest,
-) -> Result<TradePreimageResponse, String> {
-    let (my_coin_ticker, other_coin_ticker) = match req.swap_method {
-        TradePreimageMethod::SetPrice => return ERR!("Internal error: expected 'sell' or 'buy' method"),
-        TradePreimageMethod::Sell => (req.base, req.rel),
-        TradePreimageMethod::Buy => (req.rel, req.base),
+    base_coin: MmCoinEnum,
+    rel_coin: MmCoinEnum,
+) -> TradePreimageRpcResult<TakerTradePreimage> {
+    let (my_coin, other_coin) = match req.swap_method {
+        TradePreimageMethod::SetPrice => {
+            let error = "Internal error: expected 'sell' or 'buy' method".to_owned();
+            return MmError::err(TradePreimageRpcError::InternalError(error));
+        },
+        TradePreimageMethod::Sell => (base_coin, rel_coin),
+        TradePreimageMethod::Buy => (rel_coin, base_coin),
     };
-    let my_coin = match lp_coinfind(&ctx, &my_coin_ticker).await {
-        Ok(Some(t)) => t,
-        Ok(None) => return ERR!("No such coin: {}", my_coin_ticker),
-        Err(err) => return ERR!("!lp_coinfind({}): {}", my_coin_ticker, err),
-    };
-    let other_coin = match lp_coinfind(&ctx, &other_coin_ticker).await {
-        Ok(Some(t)) => t,
-        Ok(None) => return ERR!("No such coin: {}", other_coin_ticker),
-        Err(err) => return ERR!("!lp_coinfind({}): {}", other_coin_ticker, err),
-    };
+    let my_coin_ticker = my_coin.ticker();
+    let other_coin_ticker = other_coin.ticker();
+
+    if req.max {
+        return MmError::err(TradePreimageRpcError::InvalidParam {
+            param: "max".to_owned(),
+            reason: "'max' cannot be used with 'sell' or 'buy' method".to_owned(),
+        });
+    }
+
+    if req.price.is_zero() {
+        return MmError::err(TradePreimageRpcError::ZeroPrice);
+    }
+
+    if req.volume.is_zero() {
+        return MmError::err(TradePreimageRpcError::VolumeIsTooSmall {
+            volume: req.volume.to_decimal(),
+        });
+    }
 
     let stage = FeeApproxStage::TradePreimage;
-    let volume = if req.max {
-        try_s!(calc_max_taker_vol(&ctx, &my_coin, &other_coin_ticker, stage.clone()).await)
-    } else {
-        req.volume
+    let my_coin_volume = match req.swap_method {
+        TradePreimageMethod::SetPrice => {
+            let error = "Expected 'sell' or 'buy' method".to_owned();
+            return MmError::err(TradePreimageRpcError::InternalError(error));
+        },
+        TradePreimageMethod::Sell => req.volume,
+        TradePreimageMethod::Buy => req.price * req.volume,
     };
 
-    let dex_amount = dex_fee_amount_from_taker_coin(&my_coin, &other_coin_ticker, &volume);
-    let fee_to_send_dex_fee = try_s!(
-        my_coin
-            .get_fee_to_send_taker_fee(dex_amount.to_decimal(), stage.clone())
-            .compat()
-            .await
-    );
+    let dex_amount = dex_fee_amount_from_taker_coin(&my_coin, other_coin_ticker, &my_coin_volume);
+    let taker_fee = TradeFee {
+        coin: my_coin_ticker.to_owned(),
+        amount: dex_amount.clone(),
+        paid_from_trading_vol: false,
+    };
 
-    let preimage_value = TradePreimageValue::Exact(volume.to_decimal());
-    let my_coin_trade_fee = try_s!(
-        my_coin
-            .get_sender_trade_fee(preimage_value, stage.clone())
-            .compat()
-            .await
-    );
-    let other_coin_trade_fee = try_s!(other_coin.get_receiver_trade_fee(stage).compat().await);
+    let fee_to_send_taker_fee = my_coin
+        .get_fee_to_send_taker_fee(dex_amount.to_decimal(), stage.clone())
+        .compat()
+        .await
+        .mm_err(|e| TradePreimageRpcError::from_trade_preimage_error(e, my_coin_ticker))?;
+
+    let preimage_value = TradePreimageValue::Exact(my_coin_volume.to_decimal());
+    let my_coin_trade_fee = my_coin
+        .get_sender_trade_fee(preimage_value, stage.clone())
+        .compat()
+        .await
+        .mm_err(|e| TradePreimageRpcError::from_trade_preimage_error(e, my_coin_ticker))?;
+    let other_coin_trade_fee = other_coin
+        .get_receiver_trade_fee(stage)
+        .compat()
+        .await
+        .mm_err(|e| TradePreimageRpcError::from_trade_preimage_error(e, other_coin_ticker))?;
 
     let (base_coin_fee, rel_coin_fee) = match req.swap_method {
         TradePreimageMethod::Sell => (my_coin_trade_fee, other_coin_trade_fee),
         _ => (other_coin_trade_fee, my_coin_trade_fee),
     };
-    let volume = if req.max {
-        Some(DetailedVolume::from(volume))
-    } else {
-        None
-    };
-    Ok(TradePreimageResponse {
-        base_coin_fee: TradeFeeResponse::from(base_coin_fee),
-        rel_coin_fee: TradeFeeResponse::from(rel_coin_fee),
-        volume,
-        taker_fee: Some(DetailedTakerFee::from(dex_amount)),
-        fee_to_send_taker_fee: Some(TradeFeeResponse::from(fee_to_send_dex_fee)),
+    Ok(TakerTradePreimage {
+        base_coin_fee,
+        rel_coin_fee,
+        taker_fee,
+        fee_to_send_taker_fee,
     })
 }
 
@@ -1601,11 +1639,11 @@ pub async fn max_taker_vol(ctx: MmArc, req: Json) -> Result<Response<Vec<u8>>, S
     let fut = calc_max_taker_vol(&ctx, &coin, other_coin, FeeApproxStage::TradePreimage);
     let max_vol = match fut.await {
         Ok(max_vol) => max_vol,
-        Err(CheckBalanceError::NotSufficientBalance(err)) => {
-            warn!("{}", err);
+        Err(e) if e.get_inner().not_sufficient_balance() => {
+            warn!("{}", e);
             MmNumber::from(0)
         },
-        Err(CheckBalanceError::Other(err)) => {
+        Err(err) => {
             return ERR!("{}", err);
         },
     };
@@ -1643,12 +1681,9 @@ pub async fn calc_max_taker_vol(
     coin: &MmCoinEnum,
     other_coin: &str,
     stage: FeeApproxStage,
-) -> Result<MmNumber, CheckBalanceError> {
+) -> CheckBalanceResult<MmNumber> {
     let my_coin = coin.ticker();
-    let balance = MmNumber::from(try_map!(
-        coin.my_spendable_balance().compat().await,
-        CheckBalanceError::Other
-    ));
+    let balance: MmNumber = coin.my_spendable_balance().compat().await?.into();
     let locked = get_locked_amount(ctx, my_coin);
     let min_tx_amount = MmNumber::from(coin.min_tx_amount());
 
@@ -1658,7 +1693,7 @@ pub async fn calc_max_taker_vol(
         .get_sender_trade_fee(preimage_value, stage.clone())
         .compat()
         .await
-        .trace(source!())?;
+        .mm_err(|e| CheckBalanceError::from_trade_preimage_error(e, &my_coin))?;
 
     let max_vol = if my_coin == max_trade_fee.coin {
         // second case
@@ -1668,7 +1703,7 @@ pub async fn calc_max_taker_vol(
             .get_fee_to_send_taker_fee(max_dex_fee.to_decimal(), stage)
             .compat()
             .await
-            .trace(source!())?;
+            .mm_err(|e| CheckBalanceError::from_trade_preimage_error(e, &my_coin))?;
         let min_max_possible = &max_possible_2 - &max_fee_to_send_taker_fee.amount;
 
         debug!(
@@ -1680,7 +1715,7 @@ pub async fn calc_max_taker_vol(
             max_dex_fee.to_fraction(),
             max_fee_to_send_taker_fee.amount.to_fraction()
         );
-        max_taker_vol_from_available(min_max_possible, my_coin, other_coin, &min_tx_amount).trace(source!())?
+        max_taker_vol_from_available(min_max_possible, my_coin, other_coin, &min_tx_amount)?
     } else {
         // first case
         debug!(
@@ -1688,7 +1723,7 @@ pub async fn calc_max_taker_vol(
             balance.to_fraction(),
             locked.to_fraction()
         );
-        max_taker_vol_from_available(max_possible, my_coin, other_coin, &min_tx_amount).trace(source!())?
+        max_taker_vol_from_available(max_possible, my_coin, other_coin, &min_tx_amount)?
     };
     // do not check if `max_vol < min_tx_amount`, because it is checked within `max_taker_vol_from_available` already
     Ok(max_vol)
@@ -1699,7 +1734,7 @@ pub fn max_taker_vol_from_available(
     base: &str,
     rel: &str,
     min_tx_amount: &MmNumber,
-) -> Result<MmNumber, CheckBalanceError> {
+) -> CheckBalanceResult<MmNumber> {
     let fee_threshold = dex_fee_threshold(min_tx_amount.clone());
     let dex_fee_rate = dex_fee_rate(base, rel);
     let threshold_coef = &(&MmNumber::from(1) + &dex_fee_rate) / &dex_fee_rate;
@@ -1710,12 +1745,9 @@ pub fn max_taker_vol_from_available(
     };
 
     if &max_vol <= min_tx_amount {
-        let err = ERRL!(
-            "Max taker volume {:?} less than minimum transaction amount {:?}",
-            max_vol.to_fraction(),
-            min_tx_amount.to_fraction()
-        );
-        return Err(CheckBalanceError::NotSufficientBalance(err));
+        return MmError::err(CheckBalanceError::MaxVolumeLessThanDust {
+            volume: max_vol.to_decimal(),
+        });
     }
     Ok(max_vol)
 }
@@ -1723,11 +1755,12 @@ pub fn max_taker_vol_from_available(
 #[cfg(test)]
 mod taker_swap_tests {
     use super::*;
-    use crate::mm2::lp_swap::dex_fee_amount;
+    use crate::mm2::lp_swap::{dex_fee_amount, get_locked_amount_by_other_swaps};
     use coins::eth::{addr_from_str, signed_eth_tx_from_bytes, SignedEthTx};
     use coins::utxo::UtxoTx;
     use coins::{FoundSwapTxSpend, MarketCoinOps, MmCoin, SwapOps, TestCoin};
     use common::mm_ctx::MmCtxBuilder;
+    use common::new_uuid;
     use common::privkey::key_pair_from_seed;
     use mocktopus::mocking::*;
 
@@ -1766,8 +1799,8 @@ mod taker_swap_tests {
             MockResult::Return(Box::new(futures01::future::ok(eth_tx_for_test().into())))
         });
         TestCoin::search_for_swap_tx_spend_other.mock_safe(|_, _, _, _, _, _, _| MockResult::Return(Ok(None)));
-        let maker_coin = MmCoinEnum::Test(TestCoin {});
-        let taker_coin = MmCoinEnum::Test(TestCoin {});
+        let maker_coin = MmCoinEnum::Test(TestCoin::default());
+        let taker_coin = MmCoinEnum::Test(TestCoin::default());
         let (taker_swap, _) = TakerSwap::load_from_saved(ctx, maker_coin, taker_coin, taker_saved_swap).unwrap();
         let actual = taker_swap.recover_funds().unwrap();
         let expected = RecoveredSwap {
@@ -1808,8 +1841,8 @@ mod taker_swap_tests {
             unsafe { TAKER_PAYMENT_REFUND_CALLED = true };
             MockResult::Return(Box::new(futures01::future::ok(eth_tx_for_test().into())))
         });
-        let maker_coin = MmCoinEnum::Test(TestCoin {});
-        let taker_coin = MmCoinEnum::Test(TestCoin {});
+        let maker_coin = MmCoinEnum::Test(TestCoin::default());
+        let taker_coin = MmCoinEnum::Test(TestCoin::default());
         let (taker_swap, _) = TakerSwap::load_from_saved(ctx, maker_coin, taker_coin, taker_saved_swap).unwrap();
         let actual = taker_swap.recover_funds().unwrap();
         let expected = RecoveredSwap {
@@ -1856,8 +1889,8 @@ mod taker_swap_tests {
             unsafe { MAKER_PAYMENT_SPEND_CALLED = true };
             MockResult::Return(Box::new(futures01::future::ok(eth_tx_for_test().into())))
         });
-        let maker_coin = MmCoinEnum::Test(TestCoin {});
-        let taker_coin = MmCoinEnum::Test(TestCoin {});
+        let maker_coin = MmCoinEnum::Test(TestCoin::default());
+        let taker_coin = MmCoinEnum::Test(TestCoin::default());
         let (taker_swap, _) = TakerSwap::load_from_saved(ctx, maker_coin, taker_coin, taker_saved_swap).unwrap();
         let actual = taker_swap.recover_funds().unwrap();
         let expected = RecoveredSwap {
@@ -1894,8 +1927,8 @@ mod taker_swap_tests {
             unsafe { REFUND_CALLED = true };
             MockResult::Return(Box::new(futures01::future::ok(eth_tx_for_test().into())))
         });
-        let maker_coin = MmCoinEnum::Test(TestCoin {});
-        let taker_coin = MmCoinEnum::Test(TestCoin {});
+        let maker_coin = MmCoinEnum::Test(TestCoin::default());
+        let taker_coin = MmCoinEnum::Test(TestCoin::default());
         let (taker_swap, _) = TakerSwap::load_from_saved(ctx, maker_coin, taker_coin, taker_saved_swap).unwrap();
         let actual = taker_swap.recover_funds().unwrap();
         let expected = RecoveredSwap {
@@ -1925,8 +1958,8 @@ mod taker_swap_tests {
             unsafe { SEARCH_TX_SPEND_CALLED = true };
             MockResult::Return(Ok(None))
         });
-        let maker_coin = MmCoinEnum::Test(TestCoin {});
-        let taker_coin = MmCoinEnum::Test(TestCoin {});
+        let maker_coin = MmCoinEnum::Test(TestCoin::default());
+        let taker_coin = MmCoinEnum::Test(TestCoin::default());
         let (taker_swap, _) = TakerSwap::load_from_saved(ctx, maker_coin, taker_coin, taker_saved_swap).unwrap();
         taker_swap.w().data.taker_payment_lock = (now_ms() / 1000) - 3690;
         assert!(taker_swap.recover_funds().is_err());
@@ -1960,8 +1993,8 @@ mod taker_swap_tests {
             unsafe { MAKER_PAYMENT_SPEND_CALLED = true };
             MockResult::Return(Box::new(futures01::future::ok(eth_tx_for_test().into())))
         });
-        let maker_coin = MmCoinEnum::Test(TestCoin {});
-        let taker_coin = MmCoinEnum::Test(TestCoin {});
+        let maker_coin = MmCoinEnum::Test(TestCoin::default());
+        let taker_coin = MmCoinEnum::Test(TestCoin::default());
         let (taker_swap, _) = TakerSwap::load_from_saved(ctx, maker_coin, taker_coin, taker_saved_swap).unwrap();
         let actual = taker_swap.recover_funds().unwrap();
         let expected = RecoveredSwap {
@@ -1986,8 +2019,8 @@ mod taker_swap_tests {
 
         TestCoin::ticker.mock_safe(|_| MockResult::Return("ticker"));
         TestCoin::swap_contract_address.mock_safe(|_| MockResult::Return(None));
-        let maker_coin = MmCoinEnum::Test(TestCoin {});
-        let taker_coin = MmCoinEnum::Test(TestCoin {});
+        let maker_coin = MmCoinEnum::Test(TestCoin::default());
+        let taker_coin = MmCoinEnum::Test(TestCoin::default());
         let (taker_swap, _) = TakerSwap::load_from_saved(ctx, maker_coin, taker_coin, taker_saved_swap).unwrap();
         assert!(taker_swap.recover_funds().is_err());
     }
@@ -1999,9 +2032,6 @@ mod taker_swap_tests {
 
         let event = TakerSwapEvent::MakerPaymentWaitConfirmFailed("err".into());
         assert!(!event.should_ban_maker());
-
-        let event = TakerSwapEvent::NegotiateFailed("err".into());
-        assert!(event.should_ban_maker());
 
         let event = TakerSwapEvent::MakerPaymentValidateFailed("err".into());
         assert!(event.should_ban_maker());
@@ -2026,8 +2056,8 @@ mod taker_swap_tests {
             unsafe { SWAP_CONTRACT_ADDRESS_CALLED += 1 };
             MockResult::Return(Some(BytesJson::default()))
         });
-        let maker_coin = MmCoinEnum::Test(TestCoin {});
-        let taker_coin = MmCoinEnum::Test(TestCoin {});
+        let maker_coin = MmCoinEnum::Test(TestCoin::default());
+        let taker_coin = MmCoinEnum::Test(TestCoin::default());
         let (taker_swap, _) =
             TakerSwap::load_from_saved(ctx.clone(), maker_coin, taker_coin, taker_saved_swap).unwrap();
 
@@ -2058,8 +2088,8 @@ mod taker_swap_tests {
             unsafe { SWAP_CONTRACT_ADDRESS_CALLED += 1 };
             MockResult::Return(Some(BytesJson::default()))
         });
-        let maker_coin = MmCoinEnum::Test(TestCoin {});
-        let taker_coin = MmCoinEnum::Test(TestCoin {});
+        let maker_coin = MmCoinEnum::Test(TestCoin::default());
+        let taker_coin = MmCoinEnum::Test(TestCoin::default());
         let (taker_swap, _) =
             TakerSwap::load_from_saved(ctx.clone(), maker_coin, taker_coin, taker_saved_swap).unwrap();
 
@@ -2150,5 +2180,89 @@ mod taker_swap_tests {
             max_taker_vol_from_available(available.clone(), "KMD", "MORTY", &dex_fee_threshold)
                 .expect_err("!max_taker_vol_from_available success but should be error");
         }
+    }
+
+    #[test]
+    fn locked_amount_should_not_use_paid_from_trading_vol_fee() {
+        use crate::mm2::lp_swap::get_locked_amount;
+
+        let taker_saved_json = r#"{
+            "type": "Taker",
+            "uuid": "af5e0383-97f6-4408-8c03-a8eb8d17e46d",
+            "my_order_uuid": "af5e0383-97f6-4408-8c03-a8eb8d17e46d",
+            "events": [
+                {
+                    "timestamp": 1617096259172,
+                    "event": {
+                        "type": "Started",
+                        "data": {
+                            "taker_coin": "MORTY",
+                            "maker_coin": "RICK",
+                            "maker": "15d9c51c657ab1be4ae9d3ab6e76a619d3bccfe830d5363fa168424c0d044732",
+                            "my_persistent_pub": "03ad6f89abc2e5beaa8a3ac28e22170659b3209fe2ddf439681b4b8f31508c36fa",
+                            "lock_duration": 7800,
+                            "maker_amount": "0.1",
+                            "taker_amount": "0.11",
+                            "maker_payment_confirmations": 1,
+                            "maker_payment_requires_nota": false,
+                            "taker_payment_confirmations": 1,
+                            "taker_payment_requires_nota": false,
+                            "taker_payment_lock": 1617104058,
+                            "uuid": "af5e0383-97f6-4408-8c03-a8eb8d17e46d",
+                            "started_at": 1617096258,
+                            "maker_payment_wait": 1617099378,
+                            "maker_coin_start_block": 865240,
+                            "taker_coin_start_block": 869167,
+                            "fee_to_send_taker_fee": {
+                                "coin": "MORTY",
+                                "amount": "0.00001",
+                                "paid_from_trading_vol": false
+                            },
+                            "taker_payment_trade_fee": {
+                                "coin": "MORTY",
+                                "amount": "0.00001",
+                                "paid_from_trading_vol": false
+                            },
+                            "maker_payment_spend_trade_fee": {
+                                "coin": "RICK",
+                                "amount": "0.00001",
+                                "paid_from_trading_vol": true
+                            }
+                        }
+                    }
+                }
+            ],
+            "maker_amount": "0.1",
+            "maker_coin": "RICK",
+            "taker_amount": "0.11",
+            "taker_coin": "MORTY",
+            "gui": null,
+            "mm_version": "21867da64",
+            "success_events": [],
+            "error_events": []
+        }"#;
+        let taker_saved_swap: TakerSavedSwap = json::from_str(taker_saved_json).unwrap();
+        let key_pair =
+            key_pair_from_seed("spice describe gravity federal blast come thank unfair canal monkey style afraid")
+                .unwrap();
+        let ctx = MmCtxBuilder::default().with_secp256k1_key_pair(key_pair).into_mm_arc();
+
+        let maker_coin = MmCoinEnum::Test(TestCoin::new("RICK"));
+        let taker_coin = MmCoinEnum::Test(TestCoin::new("MORTY"));
+
+        TestCoin::swap_contract_address.mock_safe(|_| MockResult::Return(None));
+        TestCoin::min_tx_amount.mock_safe(|_| MockResult::Return(BigDecimal::from(0)));
+
+        let (swap, _) = TakerSwap::load_from_saved(ctx.clone(), maker_coin, taker_coin, taker_saved_swap).unwrap();
+        let swaps_ctx = SwapsContext::from_ctx(&ctx).unwrap();
+        let arc = Arc::new(swap);
+        let weak_ref = Arc::downgrade(&arc);
+        swaps_ctx.running_swaps.lock().unwrap().push(weak_ref);
+
+        let actual = get_locked_amount(&ctx, "RICK");
+        assert_eq!(actual, MmNumber::from(0));
+
+        let actual = get_locked_amount_by_other_swaps(&ctx, &new_uuid(), "RICK");
+        assert_eq!(actual, MmNumber::from(0));
     }
 }

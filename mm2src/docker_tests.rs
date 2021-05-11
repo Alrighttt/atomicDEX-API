@@ -30,6 +30,9 @@ extern crate serde_derive;
 #[cfg(test)]
 #[macro_use]
 extern crate serialization_derive;
+#[cfg(test)]
+#[macro_use]
+extern crate ser_error_derive;
 #[cfg(test)] extern crate test;
 
 #[cfg(test)]
@@ -86,6 +89,7 @@ mod docker_tests {
     mod qrc20_tests;
 
     use crate::mm2::lp_swap::dex_fee_amount;
+    use crate::mm2::mm2_tests::structs::*;
     use bigdecimal::BigDecimal;
     use bitcrypto::ChecksumType;
     use chain::OutPoint;
@@ -586,7 +590,7 @@ mod docker_tests {
             {"coin":"MYCOIN","asset":"MYCOIN","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
             {"coin":"MYCOIN1","asset":"MYCOIN1","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
         ]);
-        let mut mm_bob = MarketMakerIt::start(
+        let mm_bob = MarketMakerIt::start(
             json! ({
                 "gui": "nogui",
                 "netid": 9000,
@@ -604,7 +608,6 @@ mod docker_tests {
         )
         .unwrap();
         let (_bob_dump_log, _bob_dump_dashboard) = mm_dump(&mm_bob.log_path);
-        block_on(mm_bob.wait_for_log(60., |log| log.contains(">>>>>>>>> DEX stats "))).unwrap();
         log!([block_on(enable_native(&mm_bob, "MYCOIN", &[]))]);
         log!([block_on(enable_native(&mm_bob, "MYCOIN1", &[]))]);
         let rc = block_on(mm_bob.rpc(json! ({
@@ -705,7 +708,7 @@ mod docker_tests {
             {"coin":"MYCOIN","asset":"MYCOIN","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
             {"coin":"MYCOIN1","asset":"MYCOIN1","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
         ]);
-        let mut mm_bob = MarketMakerIt::start(
+        let mm_bob = MarketMakerIt::start(
             json! ({
                 "gui": "nogui",
                 "netid": 9000,
@@ -723,9 +726,8 @@ mod docker_tests {
         )
         .unwrap();
         let (_bob_dump_log, _bob_dump_dashboard) = mm_dump(&mm_bob.log_path);
-        block_on(mm_bob.wait_for_log(60., |log| log.contains(">>>>>>>>> DEX stats "))).unwrap();
 
-        let mut mm_alice = MarketMakerIt::start(
+        let mm_alice = MarketMakerIt::start(
             json! ({
                 "gui": "nogui",
                 "netid": 9000,
@@ -740,7 +742,6 @@ mod docker_tests {
         )
         .unwrap();
         let (_alice_dump_log, _alice_dump_dashboard) = mm_dump(&mm_alice.log_path);
-        block_on(mm_alice.wait_for_log(22., |log| log.contains(">>>>>>>>> DEX stats "))).unwrap();
 
         log!([block_on(enable_native(&mm_bob, "MYCOIN", &[]))]);
         log!([block_on(enable_native(&mm_bob, "MYCOIN1", &[]))]);
@@ -843,7 +844,7 @@ mod docker_tests {
             {"coin":"MYCOIN","asset":"MYCOIN","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
             {"coin":"MYCOIN1","asset":"MYCOIN1","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
         ]);
-        let mut mm_bob = MarketMakerIt::start(
+        let mm_bob = MarketMakerIt::start(
             json! ({
                 "gui": "nogui",
                 "netid": 9000,
@@ -861,9 +862,8 @@ mod docker_tests {
         )
         .unwrap();
         let (_bob_dump_log, _bob_dump_dashboard) = mm_dump(&mm_bob.log_path);
-        block_on(mm_bob.wait_for_log(60., |log| log.contains(">>>>>>>>> DEX stats "))).unwrap();
 
-        let mut mm_alice = MarketMakerIt::start(
+        let mm_alice = MarketMakerIt::start(
             json! ({
                 "gui": "nogui",
                 "netid": 9000,
@@ -878,7 +878,6 @@ mod docker_tests {
         )
         .unwrap();
         let (_alice_dump_log, _alice_dump_dashboard) = mm_dump(&mm_alice.log_path);
-        block_on(mm_alice.wait_for_log(22., |log| log.contains(">>>>>>>>> DEX stats "))).unwrap();
 
         log!([block_on(enable_native(&mm_bob, "MYCOIN", &[]))]);
         log!([block_on(enable_native(&mm_bob, "MYCOIN1", &[]))]);
@@ -1013,7 +1012,6 @@ mod docker_tests {
         )
         .unwrap();
         let (_bob_dump_log, _bob_dump_dashboard) = mm_dump(&mm_bob.log_path);
-        block_on(mm_bob.wait_for_log(22., |log| log.contains(">>>>>>>>> DEX stats "))).unwrap();
 
         let mut mm_alice = MarketMakerIt::start(
             json! ({
@@ -1030,7 +1028,6 @@ mod docker_tests {
         )
         .unwrap();
         let (_alice_dump_log, _alice_dump_dashboard) = mm_dump(&mm_alice.log_path);
-        block_on(mm_alice.wait_for_log(22., |log| log.contains(">>>>>>>>> DEX stats "))).unwrap();
 
         log!([block_on(enable_native(&mm_bob, "MYCOIN", &[]))]);
         log!([block_on(enable_native(&mm_bob, "MYCOIN1", &[]))]);
@@ -1102,7 +1099,7 @@ mod docker_tests {
 
     // https://github.com/KomodoPlatform/atomicDEX-API/issues/471
     #[test]
-    fn test_match_and_trade_max() {
+    fn test_match_and_trade_setprice_max() {
         let (_ctx, _, bob_priv_key) = generate_coin_with_random_privkey("MYCOIN", 1000.into());
         let (_ctx, _, alice_priv_key) = generate_coin_with_random_privkey("MYCOIN1", 2000.into());
         let coins = json! ([
@@ -1124,7 +1121,6 @@ mod docker_tests {
         )
         .unwrap();
         let (_bob_dump_log, _bob_dump_dashboard) = mm_dump(&mm_bob.log_path);
-        block_on(mm_bob.wait_for_log(22., |log| log.contains(">>>>>>>>> DEX stats "))).unwrap();
 
         let mut mm_alice = MarketMakerIt::start(
             json! ({
@@ -1141,7 +1137,6 @@ mod docker_tests {
         )
         .unwrap();
         let (_alice_dump_log, _alice_dump_dashboard) = mm_dump(&mm_alice.log_path);
-        block_on(mm_alice.wait_for_log(22., |log| log.contains(">>>>>>>>> DEX stats "))).unwrap();
 
         log!([block_on(enable_native(&mm_bob, "MYCOIN", &[]))]);
         log!([block_on(enable_native(&mm_bob, "MYCOIN1", &[]))]);
@@ -1206,6 +1201,128 @@ mod docker_tests {
     }
 
     #[test]
+    // https://github.com/KomodoPlatform/atomicDEX-API/issues/888
+    fn test_max_taker_vol_swap() {
+        let (_ctx, _, bob_priv_key) = generate_coin_with_random_privkey("MYCOIN", 1000.into());
+        let (_ctx, _, alice_priv_key) = generate_coin_with_random_privkey("MYCOIN1", 50.into());
+        let coins = json! ([
+            {"coin":"MYCOIN","asset":"MYCOIN","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
+            {"coin":"MYCOIN1","asset":"MYCOIN1","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
+        ]);
+        let mut mm_bob = MarketMakerIt::start_with_envs(
+            json! ({
+                "gui": "nogui",
+                "netid": 9000,
+                "dht": "on",  // Enable DHT without delay.
+                "passphrase": format!("0x{}", hex::encode(bob_priv_key)),
+                "coins": coins,
+                "rpc_password": "pass",
+                "i_am_seed": true,
+            }),
+            "pass".to_string(),
+            None,
+            &[("MYCOIN_FEE_DISCOUNT", "")],
+        )
+        .unwrap();
+        let (_bob_dump_log, _bob_dump_dashboard) = mm_dump(&mm_bob.log_path);
+        block_on(mm_bob.wait_for_log(22., |log| log.contains(">>>>>>>>> DEX stats "))).unwrap();
+
+        let mut mm_alice = MarketMakerIt::start_with_envs(
+            json! ({
+                "gui": "nogui",
+                "netid": 9000,
+                "dht": "on",  // Enable DHT without delay.
+                "passphrase": format!("0x{}", hex::encode(alice_priv_key)),
+                "coins": coins,
+                "rpc_password": "pass",
+                "seednodes": vec![format!("{}", mm_bob.ip)],
+            }),
+            "pass".to_string(),
+            None,
+            &[("MYCOIN_FEE_DISCOUNT", "")],
+        )
+        .unwrap();
+        let (_alice_dump_log, _alice_dump_dashboard) = mm_dump(&mm_alice.log_path);
+        block_on(mm_alice.wait_for_log(22., |log| log.contains(">>>>>>>>> DEX stats "))).unwrap();
+
+        log!([block_on(enable_native(&mm_bob, "MYCOIN", &[]))]);
+        log!([block_on(enable_native(&mm_bob, "MYCOIN1", &[]))]);
+        log!([block_on(enable_native(&mm_alice, "MYCOIN", &[]))]);
+        log!([block_on(enable_native(&mm_alice, "MYCOIN1", &[]))]);
+        let price = MmNumber::from((100, 1620));
+        let rc = block_on(mm_bob.rpc(json! ({
+            "userpass": mm_bob.userpass,
+            "method": "setprice",
+            "base": "MYCOIN",
+            "rel": "MYCOIN1",
+            "price": price,
+            "max": true,
+        })))
+        .unwrap();
+        assert!(rc.0.is_success(), "!setprice: {}", rc.1);
+
+        let rc = block_on(mm_alice.rpc(json! ({
+            "userpass": mm_alice.userpass,
+            "method": "orderbook",
+            "base": "MYCOIN1",
+            "rel": "MYCOIN",
+        })))
+        .unwrap();
+        assert!(rc.0.is_success(), "!orderbook: {}", rc.1);
+        log!((rc.1));
+        thread::sleep(Duration::from_secs(3));
+
+        let rc = block_on(mm_alice.rpc(json! ({
+            "userpass": mm_alice.userpass,
+            "method": "max_taker_vol",
+            "coin": "MYCOIN1",
+            "trade_with": "MYCOIN",
+        })))
+        .unwrap();
+        assert!(rc.0.is_success(), "!max_taker_vol: {}", rc.1);
+        let vol: MaxTakerVolResponse = json::from_str(&rc.1).unwrap();
+        let expected_vol = MmNumber::from((647499741, 12965000));
+
+        let actual_vol = MmNumber::from(vol.result.clone());
+        assert_eq!(expected_vol, actual_vol);
+
+        let rc = block_on(mm_alice.rpc(json! ({
+            "userpass": mm_alice.userpass,
+            "method": "sell",
+            "base": "MYCOIN1",
+            "rel": "MYCOIN",
+            "price": "16",
+            "volume": vol.result,
+        })))
+        .unwrap();
+        assert!(rc.0.is_success(), "!sell: {}", rc.1);
+        let sell_res: BuyOrSellRpcResult = json::from_str(&rc.1).unwrap();
+
+        block_on(mm_bob.wait_for_log(22., |log| log.contains("Entering the maker_swap_loop MYCOIN/MYCOIN1"))).unwrap();
+        block_on(mm_alice.wait_for_log(22., |log| log.contains("Entering the taker_swap_loop MYCOIN/MYCOIN1")))
+            .unwrap();
+
+        thread::sleep(Duration::from_secs(3));
+
+        let rc = block_on(mm_alice.rpc(json! ({
+            "userpass": mm_alice.userpass,
+            "method": "my_swap_status",
+            "params": {
+                "uuid": sell_res.result.uuid
+            }
+        })))
+        .unwrap();
+        assert!(rc.0.is_success(), "!my_swap_status: {}", rc.1);
+
+        let status_response: Json = json::from_str(&rc.1).unwrap();
+        let events_array = status_response["result"]["events"].as_array().unwrap();
+        let first_event_type = events_array[0]["event"]["type"].as_str().unwrap();
+        assert_eq!("Started", first_event_type);
+        block_on(mm_bob.stop()).unwrap();
+        block_on(mm_alice.stop()).unwrap();
+    }
+
+    #[test]
     fn test_buy_when_coins_locked_by_other_swap() {
         let (_ctx, _, bob_priv_key) = generate_coin_with_random_privkey("MYCOIN", 1000.into());
         let (_ctx, _, alice_priv_key) = generate_coin_with_random_privkey("MYCOIN1", 2.into());
@@ -1228,7 +1345,6 @@ mod docker_tests {
         )
         .unwrap();
         let (_bob_dump_log, _bob_dump_dashboard) = mm_dump(&mm_bob.log_path);
-        block_on(mm_bob.wait_for_log(22., |log| log.contains(">>>>>>>>> DEX stats "))).unwrap();
 
         let mut mm_alice = MarketMakerIt::start(
             json! ({
@@ -1245,7 +1361,6 @@ mod docker_tests {
         )
         .unwrap();
         let (_alice_dump_log, _alice_dump_dashboard) = mm_dump(&mm_alice.log_path);
-        block_on(mm_alice.wait_for_log(22., |log| log.contains(">>>>>>>>> DEX stats "))).unwrap();
 
         log!([block_on(enable_native(&mm_bob, "MYCOIN", &[]))]);
         log!([block_on(enable_native(&mm_bob, "MYCOIN1", &[]))]);
@@ -1299,7 +1414,7 @@ mod docker_tests {
         })))
         .unwrap();
         assert!(!rc.0.is_success(), "buy success, but should fail: {}", rc.1);
-        assert!(rc.1.contains("is larger than available"), rc.1);
+        assert!(rc.1.contains("Not enough MYCOIN1 for swap"), rc.1);
         block_on(mm_bob.stop()).unwrap();
         block_on(mm_alice.stop()).unwrap();
     }
@@ -1327,7 +1442,6 @@ mod docker_tests {
         )
         .unwrap();
         let (_bob_dump_log, _bob_dump_dashboard) = mm_dump(&mm_bob.log_path);
-        block_on(mm_bob.wait_for_log(22., |log| log.contains(">>>>>>>>> DEX stats "))).unwrap();
 
         let mut mm_alice = MarketMakerIt::start(
             json! ({
@@ -1344,7 +1458,6 @@ mod docker_tests {
         )
         .unwrap();
         let (_alice_dump_log, _alice_dump_dashboard) = mm_dump(&mm_alice.log_path);
-        block_on(mm_alice.wait_for_log(22., |log| log.contains(">>>>>>>>> DEX stats "))).unwrap();
 
         log!([block_on(enable_native(&mm_bob, "MYCOIN", &[]))]);
         log!([block_on(enable_native(&mm_bob, "MYCOIN1", &[]))]);
@@ -1398,7 +1511,7 @@ mod docker_tests {
         })))
         .unwrap();
         assert!(!rc.0.is_success(), "sell success, but should fail: {}", rc.1);
-        assert!(rc.1.contains("is larger than available"), rc.1);
+        assert!(rc.1.contains("Not enough MYCOIN1 for swap"), rc.1);
         block_on(mm_bob.stop()).unwrap();
         block_on(mm_alice.stop()).unwrap();
     }
@@ -1410,7 +1523,7 @@ mod docker_tests {
             {"coin":"MYCOIN","asset":"MYCOIN","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
             {"coin":"MYCOIN1","asset":"MYCOIN1","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
         ]);
-        let mut mm_alice = MarketMakerIt::start(
+        let mm_alice = MarketMakerIt::start(
             json! ({
                 "gui": "nogui",
                 "netid": 9000,
@@ -1425,7 +1538,6 @@ mod docker_tests {
         )
         .unwrap();
         let (_alice_dump_log, _alice_dump_dashboard) = mm_dump(&mm_alice.log_path);
-        block_on(mm_alice.wait_for_log(22., |log| log.contains(">>>>>>>>> DEX stats "))).unwrap();
 
         log!([block_on(enable_native(&mm_alice, "MYCOIN", &[]))]);
         log!([block_on(enable_native(&mm_alice, "MYCOIN1", &[]))]);
@@ -1463,11 +1575,13 @@ mod docker_tests {
     }
 
     #[test]
-    fn test_trade_preimage() {
+    fn test_maker_trade_preimage() {
         let priv_key = SecretKey::random(&mut rand4::thread_rng()).serialize();
+
         let (_ctx, mycoin) = utxo_coin_from_privkey("MYCOIN", &priv_key);
         let my_address = mycoin.my_address().expect("!my_address");
         fill_address(&mycoin, &my_address, 10.into(), 30);
+
         let (_ctx, mycoin1) = utxo_coin_from_privkey("MYCOIN1", &priv_key);
         let my_address = mycoin1.my_address().expect("!my_address");
         fill_address(&mycoin1, &my_address, 20.into(), 30);
@@ -1476,7 +1590,7 @@ mod docker_tests {
             {"coin":"MYCOIN","asset":"MYCOIN","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
             {"coin":"MYCOIN1","asset":"MYCOIN1","txversion":4,"overwintered":1,"txfee":2000,"protocol":{"type":"UTXO"}},
         ]);
-        let mut mm = MarketMakerIt::start(
+        let mm = MarketMakerIt::start(
             json! ({
                 "gui": "nogui",
                 "netid": 9000,
@@ -1491,7 +1605,364 @@ mod docker_tests {
         )
         .unwrap();
         let (_dump_log, _dump_dashboard) = mm_dump(&mm.log_path);
-        block_on(mm.wait_for_log(22., |log| log.contains(">>>>>>>>> DEX stats "))).unwrap();
+
+        log!([block_on(enable_native(&mm, "MYCOIN1", &[]))]);
+        log!([block_on(enable_native(&mm, "MYCOIN", &[]))]);
+
+        let rc = block_on(mm.rpc(json!({
+            "userpass": mm.userpass,
+            "mmrpc": "2.0",
+            "method": "trade_preimage",
+            "params": {
+                "base": "MYCOIN",
+                "rel": "MYCOIN1",
+                "swap_method": "setprice",
+                "max": true,
+            },
+        })))
+        .unwrap();
+        assert!(rc.0.is_success(), "!trade_preimage: {}", rc.1);
+        let base_coin_fee = TradeFeeForTest::new("MYCOIN", "0.00001", false);
+        let rel_coin_fee = TradeFeeForTest::new("MYCOIN1", "0.00002", true);
+        let volume = MmNumber::from("9.99999");
+
+        let my_coin_total = TotalTradeFeeForTest::new("MYCOIN", "0.00001", "0.00001");
+        let my_coin1_total = TotalTradeFeeForTest::new("MYCOIN1", "0.00002", "0");
+
+        let expected = TradePreimageResult::MakerPreimage(MakerPreimage {
+            base_coin_fee: base_coin_fee.clone(),
+            rel_coin_fee: rel_coin_fee.clone(),
+            volume: Some(volume.to_decimal()),
+            volume_rat: Some(volume.to_ratio()),
+            volume_fraction: Some(volume.to_fraction()),
+            total_fees: vec![my_coin_total, my_coin1_total],
+        });
+
+        let mut actual: RpcSuccessResponse<TradePreimageResult> = json::from_str(&rc.1).unwrap();
+        actual.result.sort_total_fees();
+        assert_eq!(expected, actual.result);
+
+        let rc = block_on(mm.rpc(json!({
+            "userpass": mm.userpass,
+            "mmrpc": "2.0",
+            "method": "trade_preimage",
+            "params": {
+                "base": "MYCOIN1",
+                "rel": "MYCOIN",
+                "swap_method": "setprice",
+                "max": true,
+            },
+        })))
+        .unwrap();
+        assert!(rc.0.is_success(), "!trade_preimage: {}", rc.1);
+        let mut actual: RpcSuccessResponse<TradePreimageResult> = json::from_str(&rc.1).unwrap();
+        actual.result.sort_total_fees();
+
+        let base_coin_fee = TradeFeeForTest::new("MYCOIN1", "0.00002", false);
+        let rel_coin_fee = TradeFeeForTest::new("MYCOIN", "0.00001", true);
+        let volume = MmNumber::from("19.99998");
+
+        let my_coin_total = TotalTradeFeeForTest::new("MYCOIN", "0.00001", "0");
+        let my_coin1_total = TotalTradeFeeForTest::new("MYCOIN1", "0.00002", "0.00002");
+        let expected = TradePreimageResult::MakerPreimage(MakerPreimage {
+            base_coin_fee: base_coin_fee.clone(),
+            rel_coin_fee: rel_coin_fee.clone(),
+            volume: Some(volume.to_decimal()),
+            volume_rat: Some(volume.to_ratio()),
+            volume_fraction: Some(volume.to_fraction()),
+            total_fees: vec![my_coin_total, my_coin1_total],
+        });
+
+        actual.result.sort_total_fees();
+        assert_eq!(expected, actual.result);
+
+        let rc = block_on(mm.rpc(json!({
+            "userpass": mm.userpass,
+            "mmrpc": "2.0",
+            "method": "trade_preimage",
+            "params": {
+                "base": "MYCOIN1",
+                "rel": "MYCOIN",
+                "swap_method": "setprice",
+                "volume": "19.99998",
+            },
+        })))
+        .unwrap();
+        assert!(rc.0.is_success(), "!trade_preimage: {}", rc.1);
+        let mut actual: RpcSuccessResponse<TradePreimageResult> = json::from_str(&rc.1).unwrap();
+        actual.result.sort_total_fees();
+
+        let base_coin_fee = TradeFeeForTest::new("MYCOIN1", "0.00002", false);
+        let rel_coin_fee = TradeFeeForTest::new("MYCOIN", "0.00001", true);
+
+        let total_my_coin = TotalTradeFeeForTest::new("MYCOIN", "0.00001", "0");
+        let total_my_coin1 = TotalTradeFeeForTest::new("MYCOIN1", "0.00002", "0.00002");
+
+        let expected = TradePreimageResult::MakerPreimage(MakerPreimage {
+            base_coin_fee: base_coin_fee.clone(),
+            rel_coin_fee: rel_coin_fee.clone(),
+            volume: None,
+            volume_rat: None,
+            volume_fraction: None,
+            total_fees: vec![total_my_coin, total_my_coin1],
+        });
+
+        actual.result.sort_total_fees();
+        assert_eq!(expected, actual.result);
+    }
+
+    #[test]
+    fn test_taker_trade_preimage() {
+        let priv_key = SecretKey::random(&mut rand4::thread_rng()).serialize();
+
+        let (_ctx, mycoin) = utxo_coin_from_privkey("MYCOIN", &priv_key);
+        let my_address = mycoin.my_address().expect("!my_address");
+        fill_address(&mycoin, &my_address, 10.into(), 30);
+
+        let (_ctx, mycoin1) = utxo_coin_from_privkey("MYCOIN1", &priv_key);
+        let my_address = mycoin1.my_address().expect("!my_address");
+        fill_address(&mycoin1, &my_address, 20.into(), 30);
+
+        let coins = json!([
+            {"coin":"MYCOIN","asset":"MYCOIN","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
+            {"coin":"MYCOIN1","asset":"MYCOIN1","txversion":4,"overwintered":1,"txfee":2000,"protocol":{"type":"UTXO"}},
+        ]);
+        let mm = MarketMakerIt::start(
+            json! ({
+                "gui": "nogui",
+                "netid": 9000,
+                "dht": "on",  // Enable DHT without delay.
+                "passphrase": format!("0x{}", hex::encode(priv_key)),
+                "coins": coins,
+                "rpc_password": "pass",
+                "i_am_see": true,
+            }),
+            "pass".to_string(),
+            None,
+        )
+        .unwrap();
+        let (_dump_log, _dump_dashboard) = mm_dump(&mm.log_path);
+
+        log!([block_on(enable_native(&mm, "MYCOIN1", &[]))]);
+        log!([block_on(enable_native(&mm, "MYCOIN", &[]))]);
+
+        // `max` field is not supported for `buy/sell` swap methods
+        let rc = block_on(mm.rpc(json!({
+            "userpass": mm.userpass,
+            "mmrpc": "2.0",
+            "method": "trade_preimage",
+            "params": {
+                "base": "MYCOIN",
+                "rel": "MYCOIN1",
+                "swap_method": "sell",
+                "max": true,
+            },
+        })))
+        .unwrap();
+        assert!(!rc.0.is_success(), "trade_preimage success, but should fail: {}", rc.1);
+
+        let actual: RpcErrorResponse<trade_preimage_error::InvalidParam> = json::from_str(&rc.1).unwrap();
+        assert_eq!(actual.error_type, "InvalidParam", "Unexpected error_type: {}", rc.1);
+        let expected = trade_preimage_error::InvalidParam {
+            param: "max".to_owned(),
+            reason: "'max' cannot be used with 'sell' or 'buy' method".to_owned(),
+        };
+        assert_eq!(actual.error_data, Some(expected));
+
+        // `price` field is missing
+        let rc = block_on(mm.rpc(json!({
+            "userpass": mm.userpass,
+            "mmrpc": "2.0",
+            "method": "trade_preimage",
+            "params": {
+                "base": "MYCOIN",
+                "rel": "MYCOIN1",
+                "swap_method": "sell",
+                "volume": "10",
+            },
+        })))
+        .unwrap();
+        assert!(!rc.0.is_success(), "trade_preimage success, but should fail: {}", rc.1);
+        let actual: RpcErrorResponse<()> = json::from_str(&rc.1).unwrap();
+        assert_eq!(actual.error_type, "ZeroPrice", "Unexpected error_type: {}", rc.1);
+
+        let rc = block_on(mm.rpc(json!({
+            "userpass": mm.userpass,
+            "mmrpc": "2.0",
+            "method": "trade_preimage",
+            "params": {
+                "base": "MYCOIN",
+                "rel": "MYCOIN1",
+                "swap_method": "sell",
+                "volume": "7.77",
+                "price": "2",
+            },
+        })))
+        .unwrap();
+        assert!(rc.0.is_success(), "!trade_preimage: {}", rc.1);
+
+        let mut actual: RpcSuccessResponse<TradePreimageResult> = json::from_str(&rc.1).unwrap();
+        actual.result.sort_total_fees();
+
+        let base_coin_fee = TradeFeeForTest::new("MYCOIN", "0.00001", false);
+        let rel_coin_fee = TradeFeeForTest::new("MYCOIN1", "0.00002", true);
+        let taker_fee = TradeFeeForTest::new("MYCOIN", "0.01", false);
+        let fee_to_send_taker_fee = TradeFeeForTest::new("MYCOIN", "0.00001", false);
+
+        let my_coin_total_fee = TotalTradeFeeForTest::new("MYCOIN", "0.01002", "0.01002");
+        let my_coin1_total_fee = TotalTradeFeeForTest::new("MYCOIN1", "0.00002", "0");
+
+        let expected = TradePreimageResult::TakerPreimage(TakerPreimage {
+            base_coin_fee,
+            rel_coin_fee,
+            taker_fee,
+            fee_to_send_taker_fee,
+            total_fees: vec![my_coin_total_fee, my_coin1_total_fee],
+        });
+        assert_eq!(expected, actual.result);
+
+        let rc = block_on(mm.rpc(json!({
+            "userpass": mm.userpass,
+            "mmrpc": "2.0",
+            "method": "trade_preimage",
+            "params": {
+                "base": "MYCOIN",
+                "rel": "MYCOIN1",
+                "swap_method": "buy",
+                "volume": "7.77",
+                "price": "2",
+            },
+        })))
+        .unwrap();
+        assert!(rc.0.is_success(), "!trade_preimage: {}", rc.1);
+        let mut actual: RpcSuccessResponse<TradePreimageResult> = json::from_str(&rc.1).unwrap();
+        actual.result.sort_total_fees();
+
+        let base_coin_fee = TradeFeeForTest::new("MYCOIN", "0.00001", true);
+        let rel_coin_fee = TradeFeeForTest::new("MYCOIN1", "0.00002", false);
+        let taker_fee = TradeFeeForTest::new("MYCOIN1", "0.02", false);
+        let fee_to_send_taker_fee = TradeFeeForTest::new("MYCOIN1", "0.00002", false);
+
+        let my_coin_total_fee = TotalTradeFeeForTest::new("MYCOIN", "0.00001", "0");
+        let my_coin1_total_fee = TotalTradeFeeForTest::new("MYCOIN1", "0.02004", "0.02004");
+
+        let expected = TradePreimageResult::TakerPreimage(TakerPreimage {
+            base_coin_fee,
+            rel_coin_fee,
+            taker_fee,
+            fee_to_send_taker_fee,
+            total_fees: vec![my_coin_total_fee, my_coin1_total_fee],
+        });
+        assert_eq!(expected, actual.result);
+    }
+
+    #[test]
+    fn test_trade_preimage_not_sufficient_balance() {
+        let priv_key = SecretKey::random(&mut rand4::thread_rng()).serialize();
+
+        let (_ctx, mycoin1) = utxo_coin_from_privkey("MYCOIN1", &priv_key);
+        let my_address = mycoin1.my_address().expect("!my_address");
+        fill_address(&mycoin1, &my_address, 20.into(), 30);
+
+        let coins = json!([
+            {"coin":"MYCOIN","asset":"MYCOIN","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
+            {"coin":"MYCOIN1","asset":"MYCOIN1","txversion":4,"overwintered":1,"txfee":2000,"protocol":{"type":"UTXO"}},
+        ]);
+        let mm = MarketMakerIt::start(
+            json! ({
+                "gui": "nogui",
+                "netid": 9000,
+                "dht": "on",  // Enable DHT without delay.
+                "passphrase": format!("0x{}", hex::encode(priv_key)),
+                "coins": coins,
+                "rpc_password": "pass",
+                "i_am_see": true,
+            }),
+            "pass".to_string(),
+            None,
+        )
+        .unwrap();
+        let (_dump_log, _dump_dashboard) = mm_dump(&mm.log_path);
+
+        log!([block_on(enable_native(&mm, "MYCOIN1", &[]))]);
+        log!([block_on(enable_native(&mm, "MYCOIN", &[]))]);
+
+        // Try sell the max amount with the zero balance.
+        // This RPC call should fail, because if the `max` param is true,
+        // then MM2 would check the account balance, amounts locked by other swaps, etc
+        // and it turns out that the account balance is not sufficient for swap.
+        let rc = block_on(mm.rpc(json!({
+            "userpass": mm.userpass,
+            "mmrpc": "2.0",
+            "method": "trade_preimage",
+            "params": {
+                "base": "MYCOIN",
+                "rel": "MYCOIN1",
+                "swap_method": "setprice",
+                "max": true,
+            },
+        })))
+        .unwrap();
+        assert!(!rc.0.is_success(), "trade_preimage success, but should fail: {}", rc.1);
+        let actual: RpcErrorResponse<trade_preimage_error::NotSufficientBalance> = json::from_str(&rc.1).unwrap();
+        assert_eq!(actual.error_type, "NotSufficientBalance");
+        // Required at least 0.00001 MYCOIN to pay the transaction fee.
+        let required = MmNumber::from("0.00001").to_decimal();
+        let expected = trade_preimage_error::NotSufficientBalance {
+            coin: "MYCOIN".to_owned(),
+            available: BigDecimal::from(0),
+            required,
+            locked_by_swaps: Some(BigDecimal::from(0)),
+        };
+        assert_eq!(actual.error_data, Some(expected));
+
+        // But even if we pass the exact volume, the `trade_preimage` RPC call should not fail,
+        // because MYCOIN and MYCOIN1 have fixed transaction fees.
+        let rc = block_on(mm.rpc(json!({
+            "userpass": mm.userpass,
+            "mmrpc": "2.0",
+            "method": "trade_preimage",
+            "params": {
+                "base": "MYCOIN",
+                "rel": "MYCOIN1",
+                "swap_method": "setprice",
+                "volume": 0.1,
+            },
+        })))
+        .unwrap();
+        assert!(rc.0.is_success(), "!trade_preimage: {}", rc.1);
+        let _: RpcSuccessResponse<TradePreimageResult> = json::from_str(&rc.1).unwrap();
+    }
+
+    #[test]
+    fn test_trade_preimage_legacy() {
+        let priv_key = SecretKey::random(&mut rand4::thread_rng()).serialize();
+        let (_ctx, mycoin) = utxo_coin_from_privkey("MYCOIN", &priv_key);
+        let my_address = mycoin.my_address().expect("!my_address");
+        fill_address(&mycoin, &my_address, 10.into(), 30);
+        let (_ctx, mycoin1) = utxo_coin_from_privkey("MYCOIN1", &priv_key);
+        let my_address = mycoin1.my_address().expect("!my_address");
+        fill_address(&mycoin1, &my_address, 20.into(), 30);
+
+        let coins = json!([
+            {"coin":"MYCOIN","asset":"MYCOIN","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
+            {"coin":"MYCOIN1","asset":"MYCOIN1","txversion":4,"overwintered":1,"txfee":2000,"protocol":{"type":"UTXO"}},
+        ]);
+        let mm = MarketMakerIt::start(
+            json! ({
+                "gui": "nogui",
+                "netid": 9000,
+                "dht": "on",  // Enable DHT without delay.
+                "passphrase": format!("0x{}", hex::encode(priv_key)),
+                "coins": coins,
+                "rpc_password": "pass",
+                "i_am_see": true,
+            }),
+            "pass".to_string(),
+            None,
+        )
+        .unwrap();
+        let (_dump_log, _dump_dashboard) = mm_dump(&mm.log_path);
 
         log!([block_on(enable_native(&mm, "MYCOIN1", &[]))]);
         log!([block_on(enable_native(&mm, "MYCOIN", &[]))]);
@@ -1506,115 +1977,26 @@ mod docker_tests {
         })))
         .unwrap();
         assert!(rc.0.is_success(), "!trade_preimage: {}", rc.1);
-        let actual: Json = json::from_str(&rc.1).unwrap();
-        let expected = json!({
-            "result": {
-                "base_coin_fee": {
-                    "coin": "MYCOIN",
-                    "amount": "0.00001",
-                    "amount_fraction": { "numer": "1", "denom": "100000" },
-                    "amount_rat": [[1,[1]],[1,[100000]]]
-                },
-                "rel_coin_fee": {
-                    "coin": "MYCOIN1",
-                    "amount": "0",
-                    "amount_fraction": { "numer": "0", "denom": "1" },
-                    "amount_rat": [[0,[]],[1,[1]]]
-                },
-                "volume": "9.99999",
-                "volume_fraction": { "numer": "999999", "denom": "100000" },
-                "volume_rat": [[1,[999999]],[1,[100000]]]
-            }
-        });
-        assert_eq!(actual, expected);
+        let _: TradePreimageResponse = json::from_str(&rc.1).unwrap();
+
+        // vvv test a taker method vvv
 
         let rc = block_on(mm.rpc(json!({
             "userpass": mm.userpass,
             "method": "trade_preimage",
-            "base": "MYCOIN1",
-            "rel": "MYCOIN",
-            "swap_method": "setprice",
-            "max": true,
+            "base": "MYCOIN",
+            "rel": "MYCOIN1",
+            "swap_method": "sell",
+            "volume": "7.77",
+            "price": "2",
         })))
         .unwrap();
         assert!(rc.0.is_success(), "!trade_preimage: {}", rc.1);
-        let actual: Json = json::from_str(&rc.1).unwrap();
-        let expected = json!({
-            "result": {
-                "base_coin_fee": {
-                    "coin": "MYCOIN1",
-                    "amount": "0.00002",
-                    "amount_fraction": { "numer": "1", "denom": "50000" },
-                    "amount_rat": [[1,[1]],[1,[50000]]]
-                },
-                "rel_coin_fee": {
-                    "coin": "MYCOIN",
-                    "amount": "0",
-                    "amount_fraction": { "numer": "0", "denom": "1" },
-                    "amount_rat": [[0,[]],[1,[1]]]
-                },
-                "volume": "19.99998",
-                "volume_fraction": { "numer": "999999", "denom": "50000" },
-                "volume_rat": [[1,[999999]],[1,[50000]]]
-            }
-        });
-        assert_eq!(actual, expected);
+        let _: TradePreimageResponse = json::from_str(&rc.1).unwrap();
 
-        let rc = block_on(mm.rpc(json!({
-            "userpass": mm.userpass,
-            "method": "trade_preimage",
-            "base": "MYCOIN1",
-            "rel": "MYCOIN",
-            "swap_method": "setprice",
-            "volume": "19.99998",
-        })))
-        .unwrap();
-        assert!(rc.0.is_success(), "!trade_preimage: {}", rc.1);
-        let actual: Json = json::from_str(&rc.1).unwrap();
-        let expected = json!({
-            "result": {
-                "base_coin_fee": {
-                    "coin": "MYCOIN1",
-                    "amount": "0.00002",
-                    "amount_fraction": { "numer": "1", "denom": "50000" },
-                    "amount_rat": [[1,[1]],[1,[50000]]]
-                },
-                "rel_coin_fee": {
-                    "coin": "MYCOIN",
-                    "amount": "0",
-                    "amount_fraction": { "numer": "0", "denom": "1" },
-                    "amount_rat": [[0,[]],[1,[1]]]
-                },
-            }
-        });
-        assert_eq!(actual, expected);
+        // vvv test the error response vvv
 
-        let dex_fee_threshold = MmNumber::from("0.0001");
-
-        let rc = block_on(mm.rpc(json!({
-            "userpass": mm.userpass,
-            "method": "max_taker_vol",
-            "coin": "MYCOIN",
-        })))
-        .unwrap();
-        assert!(rc.0.is_success(), "!max_taker_vol: {}", rc.1);
-        let json: Json = json::from_str(&rc.1).unwrap();
-        let mycoin_max_vol: MmNumber =
-            json::from_value(json["result"].clone()).expect("Expected a number in fraction representation");
-        let mycoin_taker_fee = dex_fee_amount("MYCOIN", "MYCOIN1", &mycoin_max_vol, &dex_fee_threshold);
-
-        let rc = block_on(mm.rpc(json!({
-            "userpass": mm.userpass,
-            "method": "max_taker_vol",
-            "coin": "MYCOIN1",
-        })))
-        .unwrap();
-        assert!(rc.0.is_success(), "!max_taker_vol: {}", rc.1);
-        let json: Json = json::from_str(&rc.1).unwrap();
-        let mycoin1_max_vol: MmNumber =
-            json::from_value(json["result"].clone()).expect("Expected a number in fraction representation");
-        let mycoin1_taker_fee = dex_fee_amount("MYCOIN", "MYCOIN1", &mycoin1_max_vol, &dex_fee_threshold);
-
+        // `max` field is not supported for `buy/sell` swap methods
         let rc = block_on(mm.rpc(json!({
             "userpass": mm.userpass,
             "method": "trade_preimage",
@@ -1624,78 +2006,10 @@ mod docker_tests {
             "max": true,
         })))
         .unwrap();
-        assert!(rc.0.is_success(), "!trade_preimage: {}", rc.1);
-        let actual: Json = json::from_str(&rc.1).unwrap();
-        let expected = json!({
-            "result": {
-                "base_coin_fee": {
-                    "coin": "MYCOIN",
-                    "amount": "0.00001",
-                    "amount_fraction": { "numer": "1", "denom": "100000" },
-                    "amount_rat": [[1,[1]],[1,[100000]]]
-                },
-                "rel_coin_fee": {
-                    "coin": "MYCOIN1",
-                    "amount": "0",
-                    "amount_fraction": { "numer": "0", "denom": "1" },
-                    "amount_rat": [[0,[]],[1,[1]]]
-                },
-                "volume": mycoin_max_vol.to_decimal(),
-                "volume_fraction": mycoin_max_vol.to_fraction(),
-                "volume_rat": mycoin_max_vol.to_ratio(),
-                "taker_fee": mycoin_taker_fee.to_decimal(),
-                "taker_fee_fraction": mycoin_taker_fee.to_fraction(),
-                "taker_fee_rat": mycoin_taker_fee.to_ratio(),
-                "fee_to_send_taker_fee": {
-                    "coin": "MYCOIN",
-                    "amount": "0.00001",
-                    "amount_fraction": { "numer": "1", "denom": "100000" },
-                    "amount_rat": [[1,[1]],[1,[100000]]]
-                }
-            }
-        });
-        assert_eq!(actual, expected);
-
-        let rc = block_on(mm.rpc(json!({
-            "userpass": mm.userpass,
-            "method": "trade_preimage",
-            "base": "MYCOIN",
-            "rel": "MYCOIN1",
-            "swap_method": "buy",
-            "max": true,
-        })))
-        .unwrap();
-        assert!(rc.0.is_success(), "!trade_preimage: {}", rc.1);
-        let actual: Json = json::from_str(&rc.1).unwrap();
-        let expected = json!({
-            "result": {
-                "base_coin_fee": {
-                    "coin": "MYCOIN",
-                    "amount": "0",
-                    "amount_fraction": { "numer": "0", "denom": "1" },
-                    "amount_rat": [[0,[]],[1,[1]]]
-                },
-                "rel_coin_fee": {
-                    "coin": "MYCOIN1",
-                    "amount": "0.00002",
-                    "amount_fraction": { "numer": "1", "denom": "50000" },
-                    "amount_rat": [[1,[1]],[1,[50000]]]
-                },
-                "volume": mycoin1_max_vol.to_decimal(),
-                "volume_fraction": mycoin1_max_vol.to_fraction(),
-                "volume_rat": mycoin1_max_vol.to_ratio(),
-                "taker_fee": mycoin1_taker_fee.to_decimal(),
-                "taker_fee_fraction": mycoin1_taker_fee.to_fraction(),
-                "taker_fee_rat": mycoin1_taker_fee.to_ratio(),
-                "fee_to_send_taker_fee": {
-                    "coin": "MYCOIN1",
-                    "amount": "0.00002",
-                    "amount_fraction": { "numer": "1", "denom": "50000" },
-                    "amount_rat": [[1,[1]],[1,[50000]]]
-                }
-            }
-        });
-        assert_eq!(actual, expected);
+        assert!(!rc.0.is_success(), "trade_preimage success, but should fail: {}", rc.1);
+        assert!(rc
+            .1
+            .contains("Incorrect use of the 'max' parameter: 'max' cannot be used with 'sell' or 'buy' method"));
     }
 
     #[test]
@@ -1705,7 +2019,7 @@ mod docker_tests {
             {"coin":"MYCOIN","asset":"MYCOIN","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
             {"coin":"MYCOIN1","asset":"MYCOIN1","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
         ]);
-        let mut mm_alice = MarketMakerIt::start(
+        let mm_alice = MarketMakerIt::start(
             json! ({
                 "gui": "nogui",
                 "netid": 9000,
@@ -1720,7 +2034,6 @@ mod docker_tests {
         )
         .unwrap();
         let (_alice_dump_log, _alice_dump_dashboard) = mm_dump(&mm_alice.log_path);
-        block_on(mm_alice.wait_for_log(22., |log| log.contains(">>>>>>>>> DEX stats "))).unwrap();
 
         log!([block_on(enable_native(&mm_alice, "MYCOIN1", &[]))]);
         log!([block_on(enable_native(&mm_alice, "MYCOIN", &[]))]);
@@ -1763,7 +2076,7 @@ mod docker_tests {
             {"coin":"MYCOIN","asset":"MYCOIN","txversion":4,"overwintered":1,"txfee":10000,"protocol":{"type":"UTXO"}},
             {"coin":"MYCOIN1","asset":"MYCOIN1","txversion":4,"overwintered":1,"txfee":10000,"protocol":{"type":"UTXO"}},
         ]);
-        let mut mm_alice = MarketMakerIt::start(
+        let mm_alice = MarketMakerIt::start(
             json! ({
                 "gui": "nogui",
                 "netid": 9000,
@@ -1778,7 +2091,6 @@ mod docker_tests {
         )
         .unwrap();
         let (_alice_dump_log, _alice_dump_dashboard) = mm_dump(&mm_alice.log_path);
-        block_on(mm_alice.wait_for_log(22., |log| log.contains(">>>>>>>>> DEX stats "))).unwrap();
 
         log!([block_on(enable_native(&mm_alice, "MYCOIN1", &[]))]);
         log!([block_on(enable_native(&mm_alice, "MYCOIN", &[]))]);
@@ -1825,7 +2137,7 @@ mod docker_tests {
             {"coin":"MYCOIN","asset":"MYCOIN","txversion":4,"overwintered":1,"txfee":10000,"protocol":{"type":"UTXO"}},
             {"coin":"MYCOIN1","asset":"MYCOIN1","txversion":4,"overwintered":1,"txfee":10000,"protocol":{"type":"UTXO"},"dust":72800},
         ]);
-        let mut mm = MarketMakerIt::start(
+        let mm = MarketMakerIt::start(
             json! ({
                 "gui": "nogui",
                 "netid": 9000,
@@ -1840,7 +2152,6 @@ mod docker_tests {
         )
         .unwrap();
         let (_alice_dump_log, _alice_dump_dashboard) = mm_dump(&mm.log_path);
-        block_on(mm.wait_for_log(22., |log| log.contains(">>>>>>>>> DEX stats "))).unwrap();
 
         log!([block_on(enable_native(&mm, "MYCOIN1", &[]))]);
         log!([block_on(enable_native(&mm, "MYCOIN", &[]))]);
@@ -1881,7 +2192,7 @@ mod docker_tests {
             {"coin":"MYCOIN1","asset":"MYCOIN1","txversion":4,"overwintered":1,"txfee":10000,"protocol":{"type":"UTXO"}},
             {"coin":"KMD","txversion":4,"overwintered":1,"txfee":10000,"protocol":{"type":"UTXO"}},
         ]);
-        let mut mm_alice = MarketMakerIt::start(
+        let mm_alice = MarketMakerIt::start(
             json! ({
                 "gui": "nogui",
                 "netid": 9000,
@@ -1896,7 +2207,6 @@ mod docker_tests {
         )
         .unwrap();
         let (_alice_dump_log, _alice_dump_dashboard) = mm_dump(&mm_alice.log_path);
-        block_on(mm_alice.wait_for_log(22., |log| log.contains(">>>>>>>>> DEX stats "))).unwrap();
 
         log!([block_on(enable_native(&mm_alice, "MYCOIN1", &[]))]);
         log!([block_on(enable_native(&mm_alice, "MYCOIN", &[]))]);
@@ -1942,7 +2252,7 @@ mod docker_tests {
             {"coin":"MYCOIN","asset":"MYCOIN","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
             {"coin":"MYCOIN1","asset":"MYCOIN1","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
         ]);
-        let mut mm_alice = MarketMakerIt::start(
+        let mm_alice = MarketMakerIt::start(
             json! ({
                 "gui": "nogui",
                 "netid": 9000,
@@ -1957,7 +2267,6 @@ mod docker_tests {
         )
         .unwrap();
         let (_alice_dump_log, _alice_dump_dashboard) = mm_dump(&mm_alice.log_path);
-        block_on(mm_alice.wait_for_log(22., |log| log.contains(">>>>>>>>> DEX stats "))).unwrap();
 
         log!([block_on(enable_native(&mm_alice, "MYCOIN", &[]))]);
         log!([block_on(enable_native(&mm_alice, "MYCOIN1", &[]))]);
@@ -2016,7 +2325,6 @@ mod docker_tests {
         )
         .unwrap();
         let (_bob_dump_log, _bob_dump_dashboard) = mm_dump(&mm_bob.log_path);
-        block_on(mm_bob.wait_for_log(22., |log| log.contains(">>>>>>>>> DEX stats "))).unwrap();
 
         let mut mm_alice = MarketMakerIt::start(
             json! ({
@@ -2033,7 +2341,6 @@ mod docker_tests {
         )
         .unwrap();
         let (_alice_dump_log, _alice_dump_dashboard) = mm_dump(&mm_alice.log_path);
-        block_on(mm_alice.wait_for_log(22., |log| log.contains(">>>>>>>>> DEX stats "))).unwrap();
 
         log!([block_on(enable_native(&mm_bob, "MYCOIN", &[]))]);
         log!([block_on(enable_native(&mm_bob, "MYCOIN1", &[]))]);
@@ -2108,9 +2415,8 @@ mod docker_tests {
             "rpc_password": "pass",
             "i_am_seed": true,
         });
-        let mut mm_bob = MarketMakerIt::start(bob_conf.clone(), "pass".to_string(), None).unwrap();
+        let mm_bob = MarketMakerIt::start(bob_conf.clone(), "pass".to_string(), None).unwrap();
         let (_bob_dump_log, _bob_dump_dashboard) = mm_dump(&mm_bob.log_path);
-        block_on(mm_bob.wait_for_log(22., |log| log.contains(">>>>>>>>> DEX stats "))).unwrap();
 
         log!([block_on(enable_native(&mm_bob, "MYCOIN", &[]))]);
         log!([block_on(enable_native(&mm_bob, "MYCOIN1", &[]))]);
@@ -2130,9 +2436,8 @@ mod docker_tests {
         bob_conf["log"] = mm_bob.folder.join("mm2_dup.log").to_str().unwrap().into();
         block_on(mm_bob.stop()).unwrap();
 
-        let mut mm_bob_dup = MarketMakerIt::start(bob_conf, "pass".to_string(), None).unwrap();
+        let mm_bob_dup = MarketMakerIt::start(bob_conf, "pass".to_string(), None).unwrap();
         let (_bob_dup_dump_log, _bob_dup_dump_dashboard) = mm_dump(&mm_bob_dup.log_path);
-        block_on(mm_bob_dup.wait_for_log(22., |log| log.contains(">>>>>>>>> DEX stats "))).unwrap();
         log!([block_on(enable_native(&mm_bob_dup, "MYCOIN", &[]))]);
         log!([block_on(enable_native(&mm_bob_dup, "MYCOIN1", &[]))]);
 
@@ -2172,9 +2477,8 @@ mod docker_tests {
             "rpc_password": "pass",
             "i_am_seed": true,
         });
-        let mut relay = MarketMakerIt::start(relay_conf, "pass".to_string(), None).unwrap();
+        let relay = MarketMakerIt::start(relay_conf, "pass".to_string(), None).unwrap();
         let (_relay_dump_log, _relay_dump_dashboard) = mm_dump(&relay.log_path);
-        block_on(relay.wait_for_log(22., |log| log.contains(">>>>>>>>> DEX stats "))).unwrap();
 
         let mut bob_conf = json! ({
             "gui": "nogui",
@@ -2186,9 +2490,8 @@ mod docker_tests {
             "seednodes": vec![format!("{}", relay.ip)],
             "i_am_seed": false,
         });
-        let mut mm_bob = MarketMakerIt::start(bob_conf.clone(), "pass".to_string(), None).unwrap();
+        let mm_bob = MarketMakerIt::start(bob_conf.clone(), "pass".to_string(), None).unwrap();
         let (_bob_dump_log, _bob_dump_dashboard) = mm_dump(&mm_bob.log_path);
-        block_on(mm_bob.wait_for_log(22., |log| log.contains(">>>>>>>>> DEX stats "))).unwrap();
 
         let mut mm_alice = MarketMakerIt::start(
             json! ({
@@ -2205,7 +2508,6 @@ mod docker_tests {
         )
         .unwrap();
         let (_alice_dump_log, _alice_dump_dashboard) = mm_dump(&mm_alice.log_path);
-        block_on(mm_alice.wait_for_log(22., |log| log.contains(">>>>>>>>> DEX stats "))).unwrap();
 
         log!([block_on(enable_native(&mm_bob, "MYCOIN", &[]))]);
         log!([block_on(enable_native(&mm_bob, "MYCOIN1", &[]))]);
@@ -2230,7 +2532,6 @@ mod docker_tests {
 
         let mut mm_bob_dup = MarketMakerIt::start(bob_conf, "pass".to_string(), None).unwrap();
         let (_bob_dup_dump_log, _bob_dup_dump_dashboard) = mm_dump(&mm_bob_dup.log_path);
-        block_on(mm_bob_dup.wait_for_log(22., |log| log.contains(">>>>>>>>> DEX stats "))).unwrap();
         log!([block_on(enable_native(&mm_bob_dup, "MYCOIN", &[]))]);
         log!([block_on(enable_native(&mm_bob_dup, "MYCOIN1", &[]))]);
 
@@ -2262,7 +2563,7 @@ mod docker_tests {
             {"coin":"MYCOIN","asset":"MYCOIN","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
             {"coin":"MYCOIN1","asset":"MYCOIN1","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
         ]);
-        let mut mm_bob = MarketMakerIt::start(
+        let mm_bob = MarketMakerIt::start(
             json! ({
                 "gui": "nogui",
                 "netid": 9000,
@@ -2277,7 +2578,6 @@ mod docker_tests {
         )
         .unwrap();
         let (_bob_dump_log, _bob_dump_dashboard) = mm_dump(&mm_bob.log_path);
-        block_on(mm_bob.wait_for_log(22., |log| log.contains(">>>>>>>>> DEX stats "))).unwrap();
 
         let mut mm_alice_1 = MarketMakerIt::start(
             json! ({
@@ -2294,7 +2594,6 @@ mod docker_tests {
         )
         .unwrap();
         let (_alice_1_dump_log, _alice_1_dump_dashboard) = mm_dump(&mm_alice_1.log_path);
-        block_on(mm_alice_1.wait_for_log(22., |log| log.contains(">>>>>>>>> DEX stats "))).unwrap();
 
         let mut mm_alice_2 = MarketMakerIt::start(
             json! ({
@@ -2311,7 +2610,6 @@ mod docker_tests {
         )
         .unwrap();
         let (_alice_2_dump_log, _alice_2_dump_dashboard) = mm_dump(&mm_alice_2.log_path);
-        block_on(mm_alice_2.wait_for_log(22., |log| log.contains(">>>>>>>>> DEX stats "))).unwrap();
 
         log!([block_on(enable_native(&mm_bob, "MYCOIN", &[]))]);
         log!([block_on(enable_native(&mm_bob, "MYCOIN1", &[]))]);
@@ -2388,7 +2686,6 @@ mod docker_tests {
         )
         .unwrap();
         let (_bob_dump_log, _bob_dump_dashboard) = mm_dump(&mm_bob.log_path);
-        block_on(mm_bob.wait_for_log(22., |log| log.contains(">>>>>>>>> DEX stats "))).unwrap();
 
         let mut mm_alice = MarketMakerIt::start(
             json! ({
@@ -2405,7 +2702,6 @@ mod docker_tests {
         )
         .unwrap();
         let (_alice_1_dump_log, _alice_1_dump_dashboard) = mm_dump(&mm_alice.log_path);
-        block_on(mm_alice.wait_for_log(22., |log| log.contains(">>>>>>>>> DEX stats "))).unwrap();
 
         log!([block_on(enable_native(&mm_bob, "MYCOIN", &[]))]);
         log!([block_on(enable_native(&mm_bob, "MYCOIN1", &[]))]);
@@ -2466,7 +2762,6 @@ mod docker_tests {
         )
         .unwrap();
         let (_bob_dump_log, _bob_dump_dashboard) = mm_dump(&mm_bob.log_path);
-        block_on(mm_bob.wait_for_log(22., |log| log.contains(">>>>>>>>> DEX stats "))).unwrap();
 
         let mut mm_alice = MarketMakerIt::start(
             json! ({
@@ -2483,7 +2778,6 @@ mod docker_tests {
         )
         .unwrap();
         let (_alice_dump_log, _alice_dump_dashboard) = mm_dump(&mm_alice.log_path);
-        block_on(mm_alice.wait_for_log(22., |log| log.contains(">>>>>>>>> DEX stats "))).unwrap();
 
         log!([block_on(enable_native(&mm_bob, "MYCOIN", &[]))]);
         log!([block_on(enable_native(&mm_bob, "MYCOIN1", &[]))]);
@@ -2595,7 +2889,6 @@ mod docker_tests {
         )
         .unwrap();
         let (_bob_dump_log, _bob_dump_dashboard) = mm_dump(&mm_bob.log_path);
-        block_on(mm_bob.wait_for_log(22., |log| log.contains(">>>>>>>>> DEX stats "))).unwrap();
 
         let native = block_on(mm_bob.rpc(json! ({
             "userpass": mm_bob.userpass,
@@ -2652,7 +2945,6 @@ mod docker_tests {
         )
         .unwrap();
         let (_bob_dump_log, _bob_dump_dashboard) = mm_dump(&mm_bob.log_path);
-        block_on(mm_bob.wait_for_log(22., |log| log.contains(">>>>>>>>> DEX stats "))).unwrap();
 
         let native = block_on(mm_bob.rpc(json! ({
             "userpass": mm_bob.userpass,
@@ -2680,5 +2972,90 @@ mod docker_tests {
         let (unspents, _) = block_on(coin.list_unspent_ordered(&coin.as_ref().my_address)).unwrap();
         // 4 utxos are merged of 5 so the resulting unspents len must be 2
         assert_eq!(unspents.len(), 2);
+    }
+
+    #[test]
+    fn test_withdraw_not_sufficient_balance() {
+        let privkey = SecretKey::random(&mut rand4::thread_rng()).serialize();
+        let coins = json! ([
+            {"coin":"MYCOIN","asset":"MYCOIN","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
+            {"coin":"MYCOIN1","asset":"MYCOIN1","txversion":4,"overwintered":1,"txfee":1000,"protocol":{"type":"UTXO"}},
+        ]);
+        let mm = MarketMakerIt::start(
+            json! ({
+                "gui": "nogui",
+                "netid": 9000,
+                "dht": "on",  // Enable DHT without delay.
+                "passphrase": format!("0x{}", hex::encode(privkey)),
+                "coins": coins,
+                "rpc_password": "pass",
+                "i_am_seed": true,
+            }),
+            "pass".to_string(),
+            None,
+        )
+        .unwrap();
+        let (_bob_dump_log, _bob_dump_dashboard) = mm_dump(&mm.log_path);
+        log!([block_on(enable_native(&mm, "MYCOIN", &[]))]);
+
+        // balance = 0, but amount = 1
+        let amount = BigDecimal::from(1);
+        let withdraw = block_on(mm.rpc(json! ({
+            "mmrpc": "2.0",
+            "userpass": mm.userpass,
+            "method": "withdraw",
+            "params": {
+                "coin": "MYCOIN",
+                "to": "RJTYiYeJ8eVvJ53n2YbrVmxWNNMVZjDGLh",
+                "amount": amount,
+            },
+            "id": 0,
+        })))
+        .unwrap();
+
+        assert!(withdraw.0.is_client_error(), "RICK withdraw: {}", withdraw.1);
+        log!("error: "[withdraw.1]);
+        let error: RpcErrorResponse<withdraw_error::NotSufficientBalance> =
+            json::from_str(&withdraw.1).expect("Expected 'RpcErrorResponse<NotSufficientBalance>'");
+        let expected_error = withdraw_error::NotSufficientBalance {
+            coin: "MYCOIN".to_owned(),
+            available: 0.into(),
+            required: amount,
+        };
+        assert_eq!(error.error_type, "NotSufficientBalance");
+        assert_eq!(error.error_data, Some(expected_error));
+
+        // fill the MYCOIN balance
+        let balance = BigDecimal::from(1) / BigDecimal::from(2);
+        let (_ctx, coin) = utxo_coin_from_privkey("MYCOIN", &privkey);
+        fill_address(&coin, &coin.my_address().unwrap(), balance.clone(), 30);
+
+        // txfee = 0.00001, amount = 0.5 => required = 0.50001
+        // but balance = 0.5
+        let txfee = BigDecimal::from(1) / BigDecimal::from(100000);
+        let withdraw = block_on(mm.rpc(json! ({
+            "mmrpc": "2.0",
+            "userpass": mm.userpass,
+            "method": "withdraw",
+            "params": {
+                "coin": "MYCOIN",
+                "to": "RJTYiYeJ8eVvJ53n2YbrVmxWNNMVZjDGLh",
+                "amount": balance,
+            },
+            "id": 0,
+        })))
+        .unwrap();
+
+        assert!(withdraw.0.is_client_error(), "RICK withdraw: {}", withdraw.1);
+        log!("error: "[withdraw.1]);
+        let error: RpcErrorResponse<withdraw_error::NotSufficientBalance> =
+            json::from_str(&withdraw.1).expect("Expected 'RpcErrorResponse<NotSufficientBalance>'");
+        let expected_error = withdraw_error::NotSufficientBalance {
+            coin: "MYCOIN".to_owned(),
+            available: balance.clone(),
+            required: balance + txfee,
+        };
+        assert_eq!(error.error_type, "NotSufficientBalance");
+        assert_eq!(error.error_data, Some(expected_error));
     }
 }

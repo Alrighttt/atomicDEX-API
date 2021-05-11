@@ -1,12 +1,13 @@
 use crate::big_int_str::BigIntStr;
-use bigdecimal::BigDecimal;
-use core::ops::{Add, Div, Mul, Sub};
-use num_rational::BigRational;
+use core::ops::{Add, AddAssign, Div, Mul, Sub};
 use num_traits::{Pow, Zero};
 use serde::{de, Deserialize, Deserializer, Serialize};
 use serde_json::value::RawValue;
 use std::str::FromStr;
 
+pub use bigdecimal::BigDecimal;
+pub use num_bigint::{BigInt, Sign};
+pub use num_rational::BigRational;
 pub use paste::paste;
 
 /// Construct a `$name` detailed number that have decimal, fraction and rational representations.
@@ -30,14 +31,14 @@ macro_rules! construct_detailed {
     ($name: ident, $base_field: ident) => {
         $crate::mm_number::paste! {
             #[derive(Clone, Debug, Serialize)]
-            struct $name {
-                $base_field: BigDecimal,
-                [<$base_field _fraction>]: Fraction,
-                [<$base_field _rat>]: BigRational,
+            pub struct $name {
+                $base_field: $crate::mm_number::BigDecimal,
+                [<$base_field _fraction>]: $crate::mm_number::Fraction,
+                [<$base_field _rat>]: $crate::mm_number::BigRational,
             }
 
-            impl From<MmNumber> for $name {
-                fn from(mm_num: MmNumber) -> Self {
+            impl From<$crate::mm_number::MmNumber> for $name {
+                fn from(mm_num: $crate::mm_number::MmNumber) -> Self {
                     Self {
                         $base_field: mm_num.to_decimal(),
                         [<$base_field _fraction>]: mm_num.to_fraction(),
@@ -45,18 +46,23 @@ macro_rules! construct_detailed {
                     }
                 }
             }
+
+            #[allow(dead_code)]
+            impl $name {
+                pub fn as_ratio(&self) -> &$crate::mm_number::BigRational {
+                    &self.[<$base_field _rat>]
+                }
+            }
         }
     };
 }
-
-pub use num_bigint::{BigInt, Sign};
 
 #[derive(Clone, Debug, Eq, PartialEq, PartialOrd, Ord, Serialize)]
 pub struct MmNumber(BigRational);
 
 /// Rational number representation de/serializable in human readable form
 /// Should simplify the visual perception and parsing in code
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct Fraction {
     /// Numerator
     numer: BigIntStr,
@@ -171,6 +177,10 @@ impl From<BigRational> for MmNumber {
     fn from(r: BigRational) -> MmNumber { MmNumber(r) }
 }
 
+impl From<Fraction> for MmNumber {
+    fn from(f: Fraction) -> MmNumber { MmNumber(f.into()) }
+}
+
 impl From<MmNumber> for BigDecimal {
     fn from(n: MmNumber) -> BigDecimal { from_ratio_to_dec(&n.0) }
 }
@@ -207,6 +217,14 @@ impl Add for MmNumber {
     type Output = MmNumber;
 
     fn add(self, rhs: Self) -> Self::Output { (self.0 + rhs.0).into() }
+}
+
+impl AddAssign for MmNumber {
+    fn add_assign(&mut self, rhs: Self) { self.0 += rhs.0; }
+}
+
+impl AddAssign<&MmNumber> for MmNumber {
+    fn add_assign(&mut self, rhs: &Self) { self.0 += &rhs.0; }
 }
 
 impl Add for &MmNumber {

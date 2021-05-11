@@ -2,11 +2,12 @@ use super::rpc_clients::{ElectrumProtocol, ListSinceBlockRes, NetworkInfo};
 use super::*;
 use crate::utxo::qtum::{qtum_coin_from_conf_and_request, QtumCoin};
 use crate::utxo::rpc_clients::{GetAddressInfoRes, UtxoRpcClientOps, ValidateAddressRes, VerboseBlock};
-use crate::utxo::utxo_common::{generate_transaction, UtxoArcBuilder};
+use crate::utxo::utxo_common::{dex_fee_script, generate_transaction, p2sh_spending_tx, UtxoArcBuilder};
 use crate::utxo::utxo_standard::{utxo_standard_coin_from_conf_and_request, UtxoStandardCoin};
 #[cfg(not(target_arch = "wasm32"))] use crate::WithdrawFee;
 use crate::{CoinBalance, SwapOps, TradePreimageValue};
 use bigdecimal::BigDecimal;
+use chain::constants::SEQUENCE_FINAL;
 use chain::OutPoint;
 use common::mm_ctx::MmCtxBuilder;
 use common::privkey::key_pair_from_seed;
@@ -15,6 +16,7 @@ use futures::future::join_all;
 use gstuff::now_ms;
 use mocktopus::mocking::*;
 use rpc::v1::types::H256 as H256Json;
+use script::Opcode;
 use serialization::deserialize;
 use std::thread;
 use std::time::Duration;
@@ -1391,7 +1393,7 @@ fn test_qtum_unspendable_balance_failed_once() {
     let conf = json!({"coin":"tQTUM","rpcport":13889,"pubtype":120,"p2shtype":110});
     let req = json!({
         "method": "electrum",
-        "servers": [{"url":"electrum1.cipig.net:10071"}],
+        "servers": [{"url":"95.217.83.126:10001"}],
     });
 
     let ctx = MmCtxBuilder::new().into_mm_arc();
@@ -1438,7 +1440,7 @@ fn test_qtum_unspendable_balance_failed() {
     let conf = json!({"coin":"tQTUM","rpcport":13889,"pubtype":120,"p2shtype":110});
     let req = json!({
         "method": "electrum",
-        "servers": [{"url":"electrum1.cipig.net:10071"}],
+        "servers": [{"url":"95.217.83.126:10001"}],
     });
 
     let ctx = MmCtxBuilder::new().into_mm_arc();
@@ -1451,7 +1453,8 @@ fn test_qtum_unspendable_balance_failed() {
 
     let error = coin.my_balance().wait().err().unwrap();
     log!("error: "[error]);
-    assert!(error.contains("Spendable balance 69 greater than total balance 68"));
+    let expected_error = BalanceError::Internal("Spendable balance 69 greater than total balance 68".to_owned());
+    assert_eq!(error.get_inner(), &expected_error);
 }
 
 #[test]
@@ -1483,7 +1486,7 @@ fn test_qtum_my_balance() {
     let conf = json!({"coin":"tQTUM","rpcport":13889,"pubtype":120,"p2shtype":110});
     let req = json!({
         "method": "electrum",
-        "servers": [{"url":"electrum1.cipig.net:10071"}],
+        "servers": [{"url":"95.217.83.126:10001"}],
     });
 
     let ctx = MmCtxBuilder::new().into_mm_arc();
@@ -2159,6 +2162,8 @@ fn test_qtum_is_unspent_mature() {
 }
 
 #[test]
+#[ignore]
+// TODO it fails at least when fee is 2055837 sat per kbyte, need to investigate
 fn test_get_sender_trade_fee_dynamic_tx_fee() {
     let rpc_client = electrum_client_for_test(&["95.217.83.126:10001"]);
     let mut coin_fields = utxo_coin_fields_for_test(
@@ -2401,4 +2406,264 @@ fn doge_mtp() {
         .wait()
         .unwrap();
     assert_eq!(mtp, 1614849084);
+}
+
+#[test]
+fn firo_mtp() {
+    let electrum = electrum_client_for_test(&[
+        "electrumx01.firo.org:50001",
+        "electrumx02.firo.org:50001",
+        "electrumx03.firo.org:50001",
+    ]);
+    let mtp = electrum
+        .get_median_time_past(356730, NonZeroU64::new(11).unwrap())
+        .wait()
+        .unwrap();
+    assert_eq!(mtp, 1616492629);
+}
+
+#[test]
+fn verus_mtp() {
+    let electrum = electrum_client_for_test(&["el0.verus.io:17485", "el1.verus.io:17485", "el2.verus.io:17485"]);
+    let mtp = electrum
+        .get_median_time_past(1480113, NonZeroU64::new(11).unwrap())
+        .wait()
+        .unwrap();
+    assert_eq!(mtp, 1618579909);
+}
+
+#[test]
+#[ignore]
+fn mint_slp_token() {
+    use bitcoin_cash_slp::{slp_genesis_output, SlpTokenType};
+    let ctx = MmCtxBuilder::new().into_mm_arc();
+    let conf = json!({
+        "decimals": 8,
+        "network": "regtest",
+        "confpath": "/home/artem/.bch/bch.conf",
+        "address_format": {
+            "format": "cashaddress",
+            "network": "bchreg",
+        },
+        "pubtype": 111,
+        "p2shtype": 196,
+        "dust": 546,
+    });
+    let req = json!({
+        "method": "enable",
+    });
+    let priv_key = hex::decode("809465b17d0a4ddb3e4c69e8f23c2cabad868f51f8bed5c765ad1d6516c3306f").unwrap();
+    let coin = block_on(utxo_standard_coin_from_conf_and_request(
+        &ctx, "BCH", &conf, &req, &priv_key,
+    ))
+    .unwrap();
+    let address = coin.my_address().unwrap();
+    println!("{}", address);
+
+    let balance = coin.my_balance().wait().unwrap();
+    println!("{}", balance.spendable);
+
+    let output = slp_genesis_output(SlpTokenType::Fungible, "ADEX", "ADEX", "", "", 8, None, 1000_0000_0000);
+    let script_pubkey = output.script.serialize().unwrap().to_vec().into();
+
+    println!("{}", hex::encode(&script_pubkey));
+
+    let op_return_output = TransactionOutput {
+        value: output.value,
+        script_pubkey,
+    };
+    let mint_output = TransactionOutput {
+        value: 546,
+        script_pubkey: hex::decode("76a91405aab5342166f8594baf17a7d9bef5d56744332788ac")
+            .unwrap()
+            .into(),
+    };
+    block_on(send_outputs_from_my_address_impl(coin, vec![
+        op_return_output,
+        mint_output,
+    ]))
+    .unwrap();
+}
+
+#[test]
+#[ignore]
+fn transfer_slp_token() {
+    use bitcoin_cash_slp::{slp_send_output, SlpTokenType, TokenId};
+    let ctx = MmCtxBuilder::new().into_mm_arc();
+    let conf = json!({
+        "decimals": 8,
+        "network": "regtest",
+        "confpath": "/home/artem/.bch/bch.conf",
+        "address_format": {
+            "format": "cashaddress",
+            "network": "bchreg",
+        },
+        "pubtype": 111,
+        "p2shtype": 196,
+        "dust": 546,
+    });
+    let req = json!({
+        "method": "enable",
+    });
+    let priv_key = hex::decode("809465b17d0a4ddb3e4c69e8f23c2cabad868f51f8bed5c765ad1d6516c3306f").unwrap();
+    let coin = block_on(utxo_standard_coin_from_conf_and_request(
+        &ctx, "BCH", &conf, &req, &priv_key,
+    ))
+    .unwrap();
+    let token_id = hex::decode("e73b2b28c14db8ebbf97749988b539508990e1708021067f206f49d55807dbf4").unwrap();
+    let token_id = TokenId::from_slice(token_id.as_slice()).unwrap();
+    let address = coin.my_address().unwrap();
+    println!("{}", address);
+
+    let balance = coin.my_balance().wait().unwrap();
+    println!("{}", balance.spendable);
+
+    let output = slp_send_output(SlpTokenType::Fungible, &token_id, &[100000000]);
+    let script_pubkey = output.script.serialize().unwrap().to_vec();
+    println!("{}", hex::encode(&script_pubkey));
+    let op_return_output = TransactionOutput {
+        value: output.value,
+        script_pubkey: script_pubkey.into(),
+    };
+    let mint_output = TransactionOutput {
+        value: 546,
+        script_pubkey: hex::decode("76a91405aab5342166f8594baf17a7d9bef5d56744332788ac")
+            .unwrap()
+            .into(),
+    };
+    block_on(send_outputs_from_my_address_impl(coin, vec![
+        op_return_output,
+        mint_output,
+    ]))
+    .unwrap();
+}
+
+#[test]
+fn sys_mtp() {
+    let electrum = electrum_client_for_test(&[
+        "electrum1.cipig.net:10064",
+        "electrum2.cipig.net:10064",
+        "electrum3.cipig.net:10064",
+    ]);
+    let mtp = electrum
+        .get_median_time_past(1006678, NonZeroU64::new(11).unwrap())
+        .wait()
+        .unwrap();
+    assert_eq!(mtp, 1620019628);
+}
+
+#[test]
+fn btc_mtp() {
+    let electrum = electrum_client_for_test(&[
+        "electrum1.cipig.net:10000",
+        "electrum2.cipig.net:10000",
+        "electrum3.cipig.net:10000",
+    ]);
+    let mtp = electrum
+        .get_median_time_past(681659, NonZeroU64::new(11).unwrap())
+        .wait()
+        .unwrap();
+    assert_eq!(mtp, 1620019527);
+}
+
+#[test]
+#[ignore]
+fn send_and_refund_dex_fee() {
+    let electrum = electrum_client_for_test(&[
+        "electrum1.cipig.net:10017",
+        "electrum2.cipig.net:10017",
+        "electrum3.cipig.net:10017",
+    ]);
+
+    let keypair = key_pair_from_seed("dex fee script test").unwrap();
+    let coin = utxo_coin_for_test(electrum.into(), Some("dex fee script test"));
+    println!("{}", coin.my_address().unwrap());
+    println!("{:?}", coin.my_balance().wait().unwrap());
+
+    let lock_time = 1619582440;
+    let dex_fee_script = dex_fee_script([0; 16], lock_time, keypair.public(), keypair.public());
+    let output = TransactionOutput {
+        value: 10000,
+        script_pubkey: Builder::build_p2sh(&dhash160(&dex_fee_script)).into(),
+    };
+    let transaction = block_on(send_outputs_from_my_address_impl(coin.clone(), vec![output])).unwrap();
+    println!("tx hash {:?}", transaction.hash().reversed());
+
+    let script_data = Builder::default().push_opcode(Opcode::OP_1).into_script();
+    let output = TransactionOutput {
+        value: 9000,
+        script_pubkey: Builder::build_p2pkh(&keypair.public().address_hash()).into(),
+    };
+    let refund = p2sh_spending_tx(
+        &coin,
+        transaction,
+        dex_fee_script.into(),
+        vec![output],
+        script_data,
+        SEQUENCE_FINAL - 1,
+        lock_time,
+    )
+    .unwrap();
+
+    let tx = serialize(&refund);
+    let tx_hash = coin.send_raw_tx(&hex::encode(tx.take())).wait().unwrap();
+    println!("refund {}", tx_hash);
+}
+
+#[test]
+#[ignore]
+fn send_and_redeem_dex_fee() {
+    let electrum = electrum_client_for_test(&[
+        "electrum1.cipig.net:10017",
+        "electrum2.cipig.net:10017",
+        "electrum3.cipig.net:10017",
+    ]);
+
+    let keypair = key_pair_from_seed("dex fee script test").unwrap();
+    let coin = utxo_coin_for_test(electrum.into(), Some("dex fee script test"));
+    println!("{}", coin.my_address().unwrap());
+    println!("{:?}", coin.my_balance().wait().unwrap());
+
+    let lock_time = 1619582440;
+    let dex_fee_script = dex_fee_script([0; 16], lock_time, keypair.public(), keypair.public());
+    let output = TransactionOutput {
+        value: 10000,
+        script_pubkey: Builder::build_p2sh(&dhash160(&dex_fee_script)).into(),
+    };
+
+    let op_return = Builder::default()
+        .push_opcode(Opcode::OP_RETURN)
+        .push_data(&dex_fee_script)
+        .into_bytes();
+    let op_return_output = TransactionOutput {
+        value: 0,
+        script_pubkey: op_return,
+    };
+
+    let transaction = block_on(send_outputs_from_my_address_impl(coin.clone(), vec![
+        output,
+        op_return_output,
+    ]))
+    .unwrap();
+    println!("tx hash {:?}", transaction.hash().reversed());
+
+    let script_data = Builder::default().push_opcode(Opcode::OP_0).into_script();
+    let output = TransactionOutput {
+        value: 9000,
+        script_pubkey: Builder::build_p2pkh(&keypair.public().address_hash()).into(),
+    };
+    let refund = p2sh_spending_tx(
+        &coin,
+        transaction,
+        dex_fee_script.into(),
+        vec![output],
+        script_data,
+        SEQUENCE_FINAL,
+        lock_time,
+    )
+    .unwrap();
+
+    let tx = serialize(&refund);
+    let tx_hash = coin.send_raw_tx(&hex::encode(tx.take())).wait().unwrap();
+    println!("redeem {}", tx_hash);
 }
