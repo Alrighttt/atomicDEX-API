@@ -19,11 +19,13 @@
 //  Copyright © 2017-2019 SuperNET. All rights reserved.
 //
 
-#![cfg_attr(not(feature = "native"), allow(dead_code))]
-#![cfg_attr(not(feature = "native"), allow(unused_imports))]
+#![cfg_attr(target_arch = "wasm32", allow(dead_code))]
+#![cfg_attr(target_arch = "wasm32", allow(unused_imports))]
 
+use common::crash_reports::init_crash_reports;
+use common::log::LogLevel;
 use common::mm_ctx::MmCtxBuilder;
-use common::{block_on, double_panic_crash, safe_slurp, MM_DATETIME, MM_VERSION};
+use common::{block_on, double_panic_crash};
 
 use gstuff::slurp;
 
@@ -36,25 +38,51 @@ use std::process::exit;
 use std::ptr::null;
 use std::str;
 
-#[path = "crash_reports.rs"] pub mod crash_reports;
-use self::crash_reports::init_crash_reports;
-
 #[path = "lp_native_dex.rs"] mod lp_native_dex;
-use self::lp_native_dex::{lp_init, lp_ports};
+use self::lp_native_dex::lp_init;
 use coins::update_coins_config;
+
+#[cfg(not(target_arch = "wasm32"))]
+#[path = "database.rs"]
+pub mod database;
 
 #[path = "lp_network.rs"] pub mod lp_network;
 
 #[path = "lp_ordermatch.rs"] pub mod lp_ordermatch;
+#[path = "lp_stats.rs"] pub mod lp_stats;
 #[path = "lp_swap.rs"] pub mod lp_swap;
 #[path = "rpc.rs"] pub mod rpc;
 
-#[cfg(any(test, not(feature = "native")))]
+#[cfg(any(test, target_arch = "wasm32"))]
 #[path = "mm2_tests.rs"]
-mod mm2_tests;
+pub mod mm2_tests;
+
+const DEFAULT_LOG_FILTER: LogLevel = LogLevel::Info;
+pub const MM_DATETIME: &str = env!("MM_DATETIME");
+pub const MM_VERSION: &str = env!("MM_VERSION");
+
+pub struct LpMainParams {
+    conf: Json,
+    filter: Option<LogLevel>,
+}
+
+impl LpMainParams {
+    pub fn with_conf(conf: Json) -> LpMainParams { LpMainParams { conf, filter: None } }
+
+    #[allow(dead_code)]
+    pub fn log_filter(mut self, filter: LogLevel) -> LpMainParams {
+        self.filter = Some(filter);
+        self
+    }
+}
 
 /// * `ctx_cb` - callback used to share the `MmCtx` ID with the call site.
-pub fn lp_main(conf: Json, ctx_cb: &dyn Fn(u32)) -> Result<(), String> {
+pub async fn lp_main(params: LpMainParams, ctx_cb: &dyn Fn(u32)) -> Result<(), String> {
+    if let Err(e) = init_logger(params.filter) {
+        log!("Logger initialization failed: "(e))
+    }
+
+    let conf = params.conf;
     if !conf["rpc_password"].is_null() {
         if !conf["rpc_password"].is_string() {
             return ERR!("rpc_password must be string");
@@ -66,16 +94,12 @@ pub fn lp_main(conf: Json, ctx_cb: &dyn Fn(u32)) -> Result<(), String> {
     }
 
     if conf["passphrase"].is_string() {
-        let netid = conf["netid"].as_u64().unwrap_or(0) as u16;
-        let (_, pubport, _) = try_s!(lp_ports(netid));
-        let ctx = MmCtxBuilder::new().with_conf(conf).into_mm_arc();
-
-        if let Err(err) = ctx.init_metrics() {
-            log!("Warning: couldn't initialize metricx system: "(err));
-        }
-
+        let ctx = MmCtxBuilder::new()
+            .with_conf(conf)
+            .with_version(MM_VERSION.into())
+            .into_mm_arc();
         ctx_cb(try_s!(ctx.ffi_handle()));
-        try_s!(block_on(lp_init(pubport, ctx)));
+        try_s!(lp_init(ctx).await);
         Ok(())
     } else {
         ERR!("!passphrase")
@@ -161,7 +185,7 @@ fn help() {
         )
 }
 
-#[cfg(feature = "native")]
+#[cfg(not(target_arch = "wasm32"))]
 #[allow(dead_code)] // Not used by mm2_lib.
 pub fn mm2_main() {
     use libc::c_char;
@@ -224,6 +248,7 @@ pub fn mm2_main() {
 ///
 /// * `ctx_cb` - Invoked with the MM context handle,
 ///              allowing the `run_lp_main` caller to communicate with MM.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn run_lp_main(first_arg: Option<&str>, ctx_cb: &dyn Fn(u32)) -> Result<(), String> {
     let conf_path = env::var("MM_CONF_PATH").unwrap_or_else(|_| "MM2.json".into());
     let conf_from_file = slurp(&conf_path);
@@ -242,7 +267,7 @@ pub fn run_lp_main(first_arg: Option<&str>, ctx_cb: &dyn Fn(u32)) -> Result<(), 
 
     let mut conf: Json = match json::from_str(conf) {
         Ok(json) => json,
-        Err(err) => return ERR!("couldnt parse.({}).{}", conf, err),
+        Err(err) => return ERR!("Couldn't parse.({}).{}", conf, err),
     };
 
     if conf["coins"].is_null() {
@@ -265,15 +290,17 @@ pub fn run_lp_main(first_arg: Option<&str>, ctx_cb: &dyn Fn(u32)) -> Result<(), 
         }
     }
 
-    try_s!(lp_main(conf, ctx_cb));
+    let params = LpMainParams::with_conf(conf);
+    try_s!(block_on(lp_main(params, ctx_cb)));
     Ok(())
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn on_update_config(args: &[OsString]) -> Result<(), String> {
     let src_path = args.get(2).ok_or(ERRL!("Expect path to the source coins config."))?;
     let dst_path = args.get(3).ok_or(ERRL!("Expect destination path."))?;
 
-    let config = try_s!(safe_slurp(src_path));
+    let config = try_s!(common::safe_slurp(src_path));
     let mut config: Json = try_s!(json::from_slice(&config));
 
     let result = if config.is_array() {
@@ -293,4 +320,27 @@ fn on_update_config(args: &[OsString]) -> Result<(), String> {
     try_s!(result.serialize(&mut ser));
     try_s!(std::fs::write(&dst_path, ser.into_inner()));
     Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn init_logger(level: Option<LogLevel>) -> Result<(), String> {
+    use common::log::UnifiedLoggerBuilder;
+
+    let level = match level {
+        Some(l) => l,
+        None => LogLevel::from_env().unwrap_or(DEFAULT_LOG_FILTER),
+    };
+    UnifiedLoggerBuilder::default()
+        .level_filter(level)
+        .console(false)
+        .mm_log(true)
+        .try_init()
+}
+
+#[cfg(target_arch = "wasm32")]
+fn init_logger(level: Option<LogLevel>) -> Result<(), String> {
+    use common::log::WasmLoggerBuilder;
+
+    let level = level.unwrap_or(DEFAULT_LOG_FILTER);
+    WasmLoggerBuilder::default().level_filter(level).try_init()
 }

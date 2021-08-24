@@ -23,7 +23,7 @@ jobs:
           echo "##vso[task.setvariable variable=COMMIT_TAG]${TAG}"
           if [ -z $TAG ]; then
             echo "Commit tag is empty"
-            export RELEASE_TAG=beta-2.0.$(Build.BuildId)
+            export RELEASE_TAG=beta-2.1.$(Build.BuildId)
           else
             export DEBUG_UPLOADED="$(curl -s https://api.github.com/repos/KomodoPlatform/atomicDEX-API/releases/tags/$TAG | grep $(Agent.OS)-Debug)"
             export RELEASE_UPLOADED="$(curl -s https://api.github.com/repos/KomodoPlatform/atomicDEX-API/releases/tags/$TAG | grep $(Agent.OS)-Release)"
@@ -36,18 +36,13 @@ jobs:
           echo "##vso[task.setvariable variable=RELEASE_UPLOADED]${RELEASE_UPLOADED}"
           echo "##vso[task.setvariable variable=RELEASE_TAG]${RELEASE_TAG}"
         displayName: Setup ENV
-      - powershell: |
-          .\marketmaker_build_depends.cmd
-        displayName: Build Windows deps
-        condition: and( eq( variables['Agent.OS'], 'Windows_NT' ), eq( variables['COMMIT_TAG'], '' ) )
       - bash: |
           rm -rf upload
           mkdir upload
         displayName: 'Recreate upload dir'
       - bash: |
-          echo 2.0.$(Build.BuildId)_$(Build.SourceBranchName)_$(COMMIT_HASH)_$(Agent.OS)_Debug > MM_VERSION
+          echo 2.1.$(Build.BuildId)_$(Build.SourceBranchName)_$(COMMIT_HASH)_$(Agent.OS)_Debug > MM_VERSION
           cat MM_VERSION
-          touch mm2src/common/build.rs
           if [ $AGENT_OS = "Linux" ]
           then
             docker build -f Dockerfile.ubuntu.ci -t mm2_builder .
@@ -61,9 +56,9 @@ jobs:
             -w $PWD \
             -e HOME=/root \
             mm2_builder \
-            /bin/bash -c "source /root/.cargo/env && cargo build --features native -vv --target-dir target-xenial"
+            /bin/bash -c "source /root/.cargo/env && cargo build -vv --target-dir target-xenial"
           else
-            cargo build --features native -vv
+            cargo build -vv
           fi
         displayName: 'Build MM2 Debug'
         condition: eq( variables['DEBUG_UPLOADED'], '' )
@@ -82,7 +77,7 @@ jobs:
         condition: and( eq( variables['Agent.OS'], 'Windows_NT' ), eq( variables['DEBUG_UPLOADED'], '' ) )
       - bash: |
           rm -f MM_VERSION
-          echo 2.0.$(Build.BuildId)_$(Build.SourceBranchName)_$(COMMIT_HASH)_$(Agent.OS)_Release > MM_VERSION
+          echo 2.1.$(Build.BuildId)_$(Build.SourceBranchName)_$(COMMIT_HASH)_$(Agent.OS)_Release > MM_VERSION
           cat MM_VERSION
           touch mm2src/common/build.rs
           if [ $AGENT_OS = "Linux" ]
@@ -98,9 +93,9 @@ jobs:
             -w $PWD \
             -e HOME=/root \
             mm2_builder \
-            /bin/bash -c "source /root/.cargo/env && cargo build --features native --release -vv --target-dir target-xenial"
+            /bin/bash -c "source /root/.cargo/env && cargo build --release -vv --target-dir target-xenial"
           else
-            cargo build --features native --release -vv
+            cargo build --release -vv
           fi
         displayName: 'Build MM2 Release'
         condition: eq( variables['RELEASE_UPLOADED'], '' )
@@ -133,13 +128,3 @@ jobs:
           7z a .\upload\mm2-$(COMMIT_HASH)-$(Agent.OS)-Release.zip .\target\release\mm2.exe .\target\release\mm2.lib .\target\release\*.dll "$Env:windir\system32\msvcr100.dll" "$Env:windir\system32\msvcp140.dll" "$Env:windir\system32\vcruntime140.dll"
         displayName: 'Prepare release build upload Windows'
         condition: and( eq( variables['Agent.OS'], 'Windows_NT' ), eq( variables['RELEASE_UPLOADED'], '' ) )
-      - task: GitHubRelease@0
-        inputs:
-          action: edit
-          gitHubConnection: artemii235
-          isPreRelease: true
-          assets: 'upload/*'
-          assetUploadMode: replace
-          tagSource: manual
-          tag: $(RELEASE_TAG)
-        condition: or( eq( variables['RELEASE_UPLOADED'], '' ), eq( variables['DEBUG_UPLOADED'], '' ) )

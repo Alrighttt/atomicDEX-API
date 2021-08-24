@@ -3,11 +3,11 @@
 use super::duplex_mutex::DuplexMutex;
 use super::executor::{spawn, Timer};
 use super::{now_ms, writeln};
-use atomic::Atomic;
 use chrono::format::strftime::StrftimeItems;
 use chrono::format::DelayedFormat;
 use chrono::{Local, TimeZone, Utc};
 use crossbeam::queue::SegQueue;
+use log::Record;
 use parking_lot::Mutex;
 use serde_json::Value as Json;
 use std::cell::RefCell;
@@ -19,23 +19,53 @@ use std::fmt::Write as WriteFmt;
 use std::hash::{Hash, Hasher};
 use std::mem::swap;
 use std::ops::Deref;
-use std::os::raw::c_char;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 use std::thread;
 
-#[cfg(feature = "native")]
+pub use log::{debug, error, info, trace, warn, LevelFilter};
+
+#[cfg(target_arch = "wasm32")]
+#[path = "log/wasm_log.rs"]
+pub mod wasm_log;
+#[cfg(target_arch = "wasm32")]
+pub use wasm_log::{LogLevel, WasmCallback, WasmLoggerBuilder};
+
+#[cfg(not(target_arch = "wasm32"))]
+#[path = "log/native_log.rs"]
+mod native_log;
+#[cfg(not(target_arch = "wasm32"))]
+pub use native_log::{FfiCallback, LogLevel, UnifiedLoggerBuilder};
+
 lazy_static! {
-    static ref PRINTF_LOCK: Mutex<()> = Mutex::new(());
     /// If this C callback is present then all the logging output should happen through it
     /// (and leaving stdout untouched).
     /// The *gravity* logging still gets a copy in order for the log-based tests to work.
-    pub static ref LOG_OUTPUT: Mutex<Option<extern fn (line: *const c_char)>> = Mutex::new (None);
+    pub static ref LOG_CALLBACK: Mutex<Option<LogCallbackBoxed>> = Mutex::new(None);
+}
+
+pub type LogCallbackBoxed = Box<dyn LogCallback>;
+
+pub trait LogCallback: Send + Sync + 'static {
+    fn callback(&mut self, level: LogLevel, line: String);
+
+    fn into_boxed(self) -> LogCallbackBoxed
+    where
+        Self: Sized,
+    {
+        Box::new(self)
+    }
+}
+
+pub fn register_callback(callback: impl LogCallback) {
+    let mut log_callback = LOG_CALLBACK.lock();
+    *log_callback = Some(callback.into_boxed());
 }
 
 /// Initialized and used when there's a need to chute the logging into a given thread.
 struct Gravity {
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     /// The center of gravity, the thread where the logging should reach the `println!` output.
     target_thread_id: thread::ThreadId,
     /// Log chunks received from satellite threads.
@@ -46,26 +76,23 @@ struct Gravity {
 
 impl Gravity {
     /// Files a log chunk to be logged from the center of gravity thread.
-    #[cfg(feature = "native")]
+    #[cfg(not(target_arch = "wasm32"))]
     fn chunk2log(&self, chunk: String) {
         self.landing.push(chunk);
         if thread::current().id() == self.target_thread_id {
             self.flush()
         }
     }
-    #[cfg(not(feature = "native"))]
-    fn chunk2log(&self, chunk: String) {
-        writeln(&chunk);
-        self.landing.push(chunk);
-    }
+    #[cfg(target_arch = "wasm32")]
+    fn chunk2log(&self, chunk: String) { self.landing.push(chunk); }
 
     /// Prints the collected log chunks.  
     /// `println!` is used for compatibility with unit test stdout capturing.
-    #[cfg(feature = "native")]
+    #[cfg(not(target_arch = "wasm32"))]
     fn flush(&self) {
-        let mut tail = unwrap!(self.tail.spinlock(77));
+        let mut tail = self.tail.spinlock(77).unwrap();
         while let Ok(chunk) = self.landing.pop() {
-            let logged_with_log_output = LOG_OUTPUT.lock().is_some();
+            let logged_with_log_output = LOG_CALLBACK.lock().is_some();
             if !logged_with_log_output {
                 writeln(&chunk)
             }
@@ -75,7 +102,7 @@ impl Gravity {
             tail.push_back(chunk)
         }
     }
-    #[cfg(not(feature = "native"))]
+    #[cfg(target_arch = "wasm32")]
     fn flush(&self) {}
 }
 
@@ -84,12 +111,10 @@ thread_local! {
     static GRAVITY: RefCell<Option<Weak<Gravity>>> = RefCell::new (None)
 }
 
-#[cfg(feature = "native")]
 #[doc(hidden)]
-pub fn chunk2log(mut chunk: String) {
-    let used_log_output = if let Some(log_cb) = *LOG_OUTPUT.lock() {
-        chunk.push('\0');
-        log_cb(chunk.as_ptr() as *const c_char);
+pub fn chunk2log(mut chunk: String, level: LogLevel) {
+    let used_log_callback = if let Some(ref mut log_cb) = *LOG_CALLBACK.lock() {
+        log_cb.callback(level, chunk.clone());
         true
     } else {
         false
@@ -114,16 +139,10 @@ pub fn chunk2log(mut chunk: String) {
         return;
     }
 
-    if used_log_output {
-        return;
+    if !used_log_callback {
+        writeln(&chunk)
     }
-
-    writeln(&chunk)
 }
-
-#[cfg(not(feature = "native"))]
-#[doc(hidden)]
-pub fn chunk2log(chunk: String) { writeln(&chunk) }
 
 #[doc(hidden)]
 pub fn short_log_time(ms: u64) -> DelayedFormat<StrftimeItems<'static>> {
@@ -154,13 +173,13 @@ macro_rules! log {
         // We can optimize this with a stack-allocated SmallVec from https://github.com/arcnmx/stack-rs,
         // though it doesn't worth the trouble at the moment.
         let mut buf = String::new();
-        unwrap! (wite! (&mut buf,
+        wite! (&mut buf,
             ($crate::log::short_log_time ($crate::now_ms()))
-            if cfg! (feature = "native") {", "} else {"ʷ "}
+            if cfg! (target_arch = "wasm32") {"ʷ "} else {", "}
             (::gstuff::filename (file!())) ':' (line!()) "] "
             $($args)+)
-        );
-        $crate::log::chunk2log (buf)
+        .unwrap();
+        $crate::log::chunk2log(buf, $crate::log::LogLevel::Info)
     }}
 }
 
@@ -226,21 +245,21 @@ pub struct Status {
     pub tags: DuplexMutex<Vec<Tag>>,
     pub line: DuplexMutex<String>,
     /// The time, in milliseconds since UNIX epoch, when the tracked operation started.
-    pub start: Atomic<u64>,
+    pub start: AtomicU64,
     /// Expected time limit of the tracked operation, in milliseconds since UNIX epoch.  
     /// 0 if no deadline is set.
-    pub deadline: Atomic<u64>,
+    pub deadline: AtomicU64,
 }
 
 impl Clone for Status {
     fn clone(&self) -> Status {
-        let tags = unwrap!(self.tags.spinlock(77)).clone();
-        let line = unwrap!(self.line.spinlock(77)).clone();
+        let tags = self.tags.spinlock(77).unwrap().clone();
+        let line = self.line.spinlock(77).unwrap().clone();
         Status {
             tags: DuplexMutex::new(tags),
             line: DuplexMutex::new(line),
-            start: Atomic::new(self.start.load(Ordering::Relaxed)),
-            deadline: Atomic::new(self.deadline.load(Ordering::Relaxed)),
+            start: AtomicU64::new(self.start.load(Ordering::Relaxed)),
+            deadline: AtomicU64::new(self.deadline.load(Ordering::Relaxed)),
         }
     }
 }
@@ -267,7 +286,7 @@ impl Status {
         dashboard: &Arc<DuplexMutex<Vec<Arc<Status>>>>,
         tail: &Arc<DuplexMutex<VecDeque<LogEntry>>>,
     ) {
-        let mut dashboard = unwrap!(dashboard.spinlock(77));
+        let mut dashboard = dashboard.spinlock(77).unwrap();
         if let Some(idx) = dashboard.iter().position(|e| Arc::ptr_eq(e, status)) {
             dashboard.swap_remove(idx);
         } else {
@@ -275,13 +294,13 @@ impl Status {
         }
         drop(dashboard);
 
-        let mut tail = unwrap!(tail.spinlock(77));
+        let mut tail = tail.spinlock(77).unwrap();
         if tail.len() == tail.capacity() {
             let _ = tail.pop_front();
         }
         let mut log = LogEntry::default();
-        swap(&mut log.tags, &mut *unwrap!(status.tags.spinlock(77)));
-        swap(&mut log.line, &mut *unwrap!(status.line.spinlock(77)));
+        swap(&mut log.tags, &mut *status.tags.spinlock(77).unwrap());
+        swap(&mut log.line, &mut *status.line.spinlock(77).unwrap());
         let mut chunk = String::with_capacity(256);
         if let Err(err) = log.format(&mut chunk) {
             log! ({"log] Error formatting log entry: {}", err});
@@ -289,7 +308,7 @@ impl Status {
         tail.push_back(log);
         drop(tail);
 
-        self::chunk2log(chunk)
+        self::chunk2log(chunk, LogLevel::Info)
     }
 }
 
@@ -352,21 +371,21 @@ impl StatusHandle {
             .collect();
         if let Some(ref status) = self.status {
             // Skip a status update if it is equal to the previous update.
-            if unwrap!(status.line.spinlock(77)).as_str() == line && *unwrap!(status.tags.spinlock(77)) == tagsʹ {
+            if status.line.spinlock(77).unwrap().as_str() == line && *status.tags.spinlock(77).unwrap() == tagsʹ {
                 return;
             }
 
-            *unwrap!(status.tags.spinlock(77)) = tagsʹ;
-            *unwrap!(status.line.spinlock(77)) = String::from(line);
+            *status.tags.spinlock(77).unwrap() = tagsʹ;
+            *status.line.spinlock(77).unwrap() = String::from(line);
         } else {
             let status = Arc::new(Status {
                 tags: DuplexMutex::new(tagsʹ),
                 line: DuplexMutex::new(line.into()),
-                start: Atomic::new(now_ms()),
-                deadline: Atomic::new(0),
+                start: AtomicU64::new(now_ms()),
+                deadline: AtomicU64::new(0),
             });
             self.status = Some(status.clone());
-            unwrap!(self.dashboard.spinlock(77)).push(status);
+            self.dashboard.spinlock(77).unwrap().push(status);
         }
     }
 
@@ -374,7 +393,7 @@ impl StatusHandle {
     /// Does nothing if the status handle is empty (if the status wasn't created yet).
     pub fn append(&self, suffix: &str) {
         if let Some(ref status) = self.status {
-            unwrap!(status.line.spinlock(77)).push_str(suffix)
+            status.line.spinlock(77).unwrap().push_str(suffix)
         }
     }
 
@@ -489,17 +508,17 @@ impl LogWeak {
 /// The state used to periodically log the dashboard.
 struct DashboardLogging {
     /// The time when the dashboard was last printed into the log.
-    last_log_ms: Atomic<u64>,
+    last_log_ms: AtomicU64,
     /// Checksum of the dashboard that was last printed into the log.  
     /// Allows us to detect whether the dashboard has changed since then.
-    last_hash: Atomic<u64>,
+    last_hash: AtomicU64,
 }
 
 impl Default for DashboardLogging {
     fn default() -> DashboardLogging {
         DashboardLogging {
-            last_log_ms: Atomic::new(0),
-            last_hash: Atomic::new(0),
+            last_log_ms: AtomicU64::new(0),
+            last_hash: AtomicU64::new(0),
         }
     }
 }
@@ -530,7 +549,7 @@ fn log_dashboard_sometimesʹ(dashboard: &[Arc<Status>], dl: &mut DashboardLoggin
     dl.last_hash.store(hash, Ordering::Relaxed);
     dl.last_log_ms.store(now, Ordering::Relaxed);
     let mut buf = String::with_capacity(7777);
-    unwrap!(wite! (buf, "+--- " (short_log_time (now)) " -------"));
+    wite! (buf, "+--- " (short_log_time (now)) " -------").unwrap();
     for status in dashboard.iter() {
         let start = status.start.load(Ordering::Relaxed);
         let deadline = status.deadline.load(Ordering::Relaxed);
@@ -544,13 +563,14 @@ fn log_dashboard_sometimesʹ(dashboard: &[Arc<Status>], dl: &mut DashboardLoggin
             Ok(l) => l.clone(),
             Err(_) => "-locked-".into(),
         };
-        unwrap!(wite! (buf,
+        wite! (buf,
           "\n| (" if passed >= 0 {(passed / 60) ':' {"{:0>2}", passed % 60}} else {'-'}
           if deadline > 0 {'/' (timeframe / 60) ':' {"{:0>2}", timeframe % 60}} ") "
           '[' for t in tags {(t.key) if let Some (ref v) = t.val {'=' (v)}} separated {' '} "] "
-          (line)));
+          (line))
+        .unwrap();
     }
-    chunk2log(buf)
+    chunk2log(buf, LogLevel::Info)
 }
 
 async fn log_dashboard_sometimes(dashboardʷ: Weak<DuplexMutex<Vec<Arc<Status>>>>) {
@@ -562,7 +582,7 @@ async fn log_dashboard_sometimes(dashboardʷ: Weak<DuplexMutex<Vec<Arc<Status>>>
             Some(arc) => arc,
             None => break,
         };
-        let dashboard = unwrap!(dashboard.sleeplock(77).await);
+        let dashboard = dashboard.sleeplock(77).await.unwrap();
         log_dashboard_sometimesʹ(&*dashboard, &mut dashboard_logging);
     }
 }
@@ -604,7 +624,7 @@ impl LogState {
 
     /// Read-only access to the status dashboard.
     pub fn with_dashboard(&self, cb: &mut dyn FnMut(&[Arc<Status>])) {
-        let dashboard = unwrap!(self.dashboard.spinlock(77));
+        let dashboard = self.dashboard.spinlock(77).unwrap();
         cb(&dashboard[..])
     }
 
@@ -651,9 +671,9 @@ impl LogState {
                 val: t.val(),
             })
             .collect();
-        let dashboard = unwrap!(self.dashboard.spinlock(77));
+        let dashboard = self.dashboard.spinlock(77).unwrap();
         for status_arc in &*dashboard {
-            if *unwrap!(status_arc.tags.spinlock(77)) == tags {
+            if *status_arc.tags.spinlock(77).unwrap() == tags {
                 found.push(StatusHandle {
                     status: Some(status_arc.clone()),
                     dashboard: self.dashboard.clone(),
@@ -677,7 +697,7 @@ impl LogState {
                 val: t.val(),
             })
             .collect();
-        for en in unwrap!(self.tail.spinlock(77)).iter() {
+        for en in self.tail.spinlock(77).unwrap().iter() {
             if en.tags == tags {
                 return true;
             }
@@ -743,7 +763,7 @@ impl LogState {
             return;
         }
 
-        let mut tail = unwrap!(self.tail.spinlock(77));
+        let mut tail = self.tail.spinlock(77).unwrap();
         if tail.len() == tail.capacity() {
             let _ = tail.pop_front();
         }
@@ -754,7 +774,7 @@ impl LogState {
     }
 
     fn chunk2log(&self, chunk: String) {
-        self::chunk2log(chunk)
+        self::chunk2log(chunk, LogLevel::Info)
         /*
         match self.log_file {
             Some (ref f) => match f.lock() {
@@ -785,7 +805,7 @@ impl LogState {
     /// Useful for unit tests, since they can only capture the output made from the initial test thread
     /// (https://github.com/rust-lang/rust/issues/12309,
     ///  https://github.com/rust-lang/rust/issues/50297#issuecomment-388988381).
-    #[cfg(feature = "native")]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn thread_gravity_on(&self) -> Result<(), String> {
         let mut gravity = try_s!(self.gravity.spinlock(77));
         if let Some(ref gravity) = *gravity {
@@ -803,11 +823,11 @@ impl LogState {
             Ok(())
         }
     }
-    #[cfg(not(feature = "native"))]
+    #[cfg(target_arch = "wasm32")]
     pub fn thread_gravity_on(&self) -> Result<(), String> { Ok(()) }
 
     /// Start intercepting the `log!` invocations happening on the current thread.
-    #[cfg(feature = "native")]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn register_my_thread(&self) -> Result<(), String> {
         let gravity = try_s!(self.gravity.spinlock(77));
         if let Some(ref gravity) = *gravity {
@@ -820,11 +840,11 @@ impl LogState {
         }
         Ok(())
     }
-    #[cfg(not(feature = "native"))]
+    #[cfg(target_arch = "wasm32")]
     pub fn register_my_thread(&self) -> Result<(), String> { Ok(()) }
 }
 
-#[cfg(feature = "native")]
+#[cfg(not(target_arch = "wasm32"))]
 impl Drop for LogState {
     fn drop(&mut self) {
         // Make sure to log the chunks received from the satellite threads.
@@ -842,7 +862,7 @@ impl Drop for LogState {
             gravity.flush()
         }
 
-        let dashboard_copy = unwrap!(self.dashboard.spinlock(77)).clone();
+        let dashboard_copy = self.dashboard.spinlock(77).unwrap().clone();
         if !dashboard_copy.is_empty() {
             log!("--- LogState] Bye! Remaining status entries. ---");
             for status in &*dashboard_copy {
@@ -852,6 +872,81 @@ impl Drop for LogState {
             log!("LogState] Bye!");
         }
     }
+}
+
+impl From<log::Level> for LogLevel {
+    fn from(orig: log::Level) -> Self {
+        use log::Level;
+        match orig {
+            Level::Error => LogLevel::Error,
+            Level::Warn => LogLevel::Warn,
+            Level::Info => LogLevel::Info,
+            Level::Debug => LogLevel::Debug,
+            Level::Trace => LogLevel::Trace,
+        }
+    }
+}
+
+impl From<LogLevel> for LevelFilter {
+    fn from(level: LogLevel) -> Self {
+        match level {
+            LogLevel::Off => LevelFilter::Off,
+            LogLevel::Error => LevelFilter::Error,
+            LogLevel::Warn => LevelFilter::Warn,
+            LogLevel::Info => LevelFilter::Info,
+            LogLevel::Debug => LevelFilter::Debug,
+            LogLevel::Trace => LevelFilter::Trace,
+        }
+    }
+}
+
+impl fmt::Display for LogLevel {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let level = match self {
+            LogLevel::Off => "OFF",
+            LogLevel::Error => "ERROR",
+            LogLevel::Warn => "WARN",
+            LogLevel::Info => "INFO",
+            LogLevel::Debug => "DEBUG",
+            LogLevel::Trace => "TRACE",
+        };
+        write!(f, "{}", level)
+    }
+}
+
+/// It's the temporary `log::Record` formatter.
+/// Format: `{d(%d %H:%M:%S)(utc)}, {f}:{L}] {l} {m}`
+pub fn format_record(record: &Record) -> String {
+    const DATE_FORMAT: &str = "%d %H:%M:%S";
+
+    fn extract_crate_name(module_path: &str) -> &str {
+        match module_path.find("::") {
+            Some(ofs) => &module_path[0..ofs],
+            None => module_path,
+        }
+    }
+
+    let metadata = record.metadata();
+    let level = metadata.level();
+    let date = Utc::now().format(DATE_FORMAT);
+    let line = record.line().unwrap_or(0);
+    let file = record.file().map(gstuff::filename).unwrap_or("???");
+    let module = record.module_path().unwrap_or("");
+    let message = record.args();
+
+    let file = if module.contains("mm2") {
+        file.to_owned()
+    } else {
+        format!("{}:{}", extract_crate_name(module), file)
+    };
+    format!(
+        "{d}, {f}:{L}] {l} {m}",
+        d = date,
+        f = file,
+        L = line,
+        l = level,
+        m = message
+    )
 }
 
 #[doc(hidden)]
@@ -871,10 +966,10 @@ pub mod tests {
             log.with_dashboard(&mut |dashboard| {
                 assert_eq!(dashboard.len(), 1);
                 let status = &dashboard[0];
-                assert!(unwrap!(status.tags.spinlock(77)).iter().any(|tag| tag.key == "tag1"));
-                assert!(unwrap!(status.tags.spinlock(77)).iter().any(|tag| tag.key == "tag2"));
-                assert_eq!(unwrap!(status.tags.spinlock(77)).len(), 2);
-                assert_eq!(*unwrap!(status.line.spinlock(77)), format!("line {}", n));
+                assert!(status.tags.spinlock(77).unwrap().iter().any(|tag| tag.key == "tag1"));
+                assert!(status.tags.spinlock(77).unwrap().iter().any(|tag| tag.key == "tag2"));
+                assert_eq!(status.tags.spinlock(77).unwrap().len(), 2);
+                assert_eq!(*status.line.spinlock(77).unwrap(), format!("line {}", n));
             });
         }
         drop(handle);
@@ -893,14 +988,14 @@ pub mod tests {
     pub fn test_printed_dashboard() {
         crate::writeln(""); // Begin from a new line in the --nocapture mode.
         let log = LogState::in_memory();
-        unwrap!(log.thread_gravity_on());
-        unwrap!(log.register_my_thread());
+        log.thread_gravity_on().unwrap();
+        log.register_my_thread().unwrap();
         let mut status = log.status_handle();
         status.status(&[&"tag"], "status 1%…");
         status.timeframe((3 * 60 + 33) * 1000);
 
         {
-            let dashboard = unwrap!(log.dashboard.spinlock(77));
+            let dashboard = log.dashboard.spinlock(77).unwrap();
             let mut dashboard_logging = super::DashboardLogging::default();
             super::log_dashboard_sometimesʹ(&*dashboard, &mut dashboard_logging);
         }

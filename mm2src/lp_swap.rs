@@ -54,88 +54,176 @@
 //  lp_swap.rs
 //  marketmaker
 //
-#![allow(uncommon_codepoints)]
-#![cfg_attr(not(feature = "native"), allow(dead_code))]
 
+#[cfg(not(target_arch = "wasm32"))]
+use crate::mm2::database::database_common::PagingOptions;
+use crate::mm2::lp_network::broadcast_p2p_msg;
 use async_std::sync as async_std_sync;
 use bigdecimal::BigDecimal;
-use coins::{lp_coinfind, TradeFee, TransactionEnum};
-use common::{block_on,
-             executor::spawn,
+use coins::{lp_coinfind, MmCoinEnum, TradeFee, TransactionEnum};
+use common::{bits256, block_on, calc_total_pages,
+             executor::{spawn, Timer},
+             log::{error, info},
              mm_ctx::{from_ctx, MmArc},
              mm_number::MmNumber,
-             read_dir, rpc_response, slurp, write, HyRes, P2PMessage};
+             now_ms, read_dir, rpc_response, slurp, var, write, HyRes};
+use futures::future::{abortable, AbortHandle, TryFutureExt};
 use http::Response;
-use primitives::hash::{H160, H256, H264};
+use mm2_libp2p::{decode_signed, encode_and_sign, pub_sub_topic, TopicPrefix};
+use num_rational::BigRational;
+use primitives::hash::{H160, H264};
 use rpc::v1::types::{Bytes as BytesJson, H256 as H256Json};
 use serde_json::{self as json, Value as Json};
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::PathBuf;
+use std::str::FromStr;
 use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::Duration;
 use uuid::Uuid;
 
-// NB: Using a macro instead of a function in order to preserve the line numbers in the log.
-macro_rules! send {
-    ($ctx: expr, $to: expr, $subj: expr, $fallback: expr, $payload: expr) => {{
-        // Checksum here helps us visually verify the logistics between the Maker and Taker logs.
-        let crc = crc32::checksum_ieee (&$payload);
-        log!("Sending '" ($subj) "' (" ($payload.len()) " bytes, crc " (crc) ")");
-
-        peers::send ($ctx.clone(), $to, Vec::from ($subj.as_bytes()), $fallback, $payload.into()).await
-    }}
-}
-
-// NB: `$validator` is where we should put the decryption and verification in,
-// in order for the bogus DHT input to disrupt communication less.
-macro_rules! recv_ {
-    ($swap: expr, $subj: expr, $timeout_sec: expr, $ec: expr, $validator: expr) => {{
-        let recv_subject = fomat! (($subj) '@' ($swap.uuid));
-        let recv_subjectᵇ = recv_subject.clone().into_bytes();
-        let fallback = ($timeout_sec / 3) .min (30) .max (60) as u8;
-        let recv_f = peers::recv ($swap.ctx.clone(), recv_subjectᵇ, fallback, $validator);
-
-        let started = now_float();
-        let timeout = (BASIC_COMM_TIMEOUT + $timeout_sec) as f64;
-        let timeoutᶠ = Timer::till (started + timeout);
-        (async move {
-            let r = match futures::future::select (Box::pin (recv_f), timeoutᶠ) .await {
-                Either::Left ((r, _)) => r,
-                Either::Right (_) => return ERR! ("timeout ({:.1} > {:.1})", now_float() - started, timeout)
-            };
-            if let Ok (ref payload) = r {
-                // Checksum here helps us visually verify the logistics between the Maker and Taker logs.
-                let crc = crc32::checksum_ieee (&payload);
-                log! ("Received '" (recv_subject) "' (" (payload.len()) " bytes, crc " (crc) ")");
-            }
-            r
-        }).await
-    }}
-}
-
-macro_rules! recv {
-    ($selff: ident, $subj: expr, $timeout_sec: expr, $ec: expr, $validator: expr) => {
-        recv_!($selff, $subj, $timeout_sec, $ec, $validator)
-    };
-    // Use this form if there's a sending future to terminate upon receiving the answer.
-    ($selff: ident, $sending_f: ident, $subj: expr, $timeout_sec: expr, $ec: expr, $validator: expr) => {{
-        let payload = recv_!($selff, $subj, $timeout_sec, $ec, $validator);
-        drop($sending_f);
-        payload
-    }};
-}
-
 #[path = "lp_swap/maker_swap.rs"] mod maker_swap;
 
 #[path = "lp_swap/taker_swap.rs"] mod taker_swap;
 
-pub use maker_swap::{check_balance_for_maker_swap, run_maker_swap, MakerSwap, RunMakerSwapInput};
-use maker_swap::{stats_maker_swap_file_path, MakerSavedSwap, MakerSwapEvent};
-use num_rational::BigRational;
-pub use taker_swap::{check_balance_for_taker_swap, max_taker_vol, run_taker_swap, RunTakerSwapInput, TakerSwap};
-use taker_swap::{stats_taker_swap_file_path, TakerSavedSwap, TakerSwapEvent};
+#[path = "lp_swap/pubkey_banning.rs"] mod pubkey_banning;
+
+#[path = "lp_swap/check_balance.rs"] mod check_balance;
+#[path = "lp_swap/trade_preimage.rs"] mod trade_preimage;
+
+pub use check_balance::{check_other_coin_balance_for_swap, CheckBalanceError};
+pub use maker_swap::{calc_max_maker_vol, check_balance_for_maker_swap, maker_swap_trade_preimage, run_maker_swap,
+                     stats_maker_swap_dir, MakerSavedSwap, MakerSwap, MakerTradePreimage, RunMakerSwapInput};
+use maker_swap::{stats_maker_swap_file_path, MakerSwapEvent};
+use pubkey_banning::BanReason;
+pub use pubkey_banning::{ban_pubkey_rpc, is_pubkey_banned, list_banned_pubkeys_rpc, unban_pubkeys_rpc};
+pub use taker_swap::{calc_max_taker_vol, check_balance_for_taker_swap, max_taker_vol, max_taker_vol_from_available,
+                     run_taker_swap, stats_taker_swap_dir, taker_swap_trade_preimage, RunTakerSwapInput,
+                     TakerSavedSwap, TakerSwap, TakerSwapPreparedParams, TakerTradePreimage};
+use taker_swap::{stats_taker_swap_file_path, TakerSwapEvent};
+pub use trade_preimage::trade_preimage_rpc;
+
+pub const SWAP_PREFIX: TopicPrefix = "swap";
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub enum SwapMsg {
+    Negotiation(NegotiationDataMsg),
+    NegotiationReply(NegotiationDataMsg),
+    Negotiated(bool),
+    TakerFee(Vec<u8>),
+    MakerPayment(Vec<u8>),
+    TakerPayment(Vec<u8>),
+}
+
+#[derive(Debug, Default)]
+pub struct SwapMsgStore {
+    negotiation: Option<NegotiationDataMsg>,
+    negotiation_reply: Option<NegotiationDataMsg>,
+    negotiated: Option<bool>,
+    taker_fee: Option<Vec<u8>>,
+    maker_payment: Option<Vec<u8>>,
+    taker_payment: Option<Vec<u8>>,
+    accept_only_from: bits256,
+}
+
+impl SwapMsgStore {
+    pub fn new(accept_only_from: bits256) -> Self {
+        SwapMsgStore {
+            accept_only_from,
+            ..Default::default()
+        }
+    }
+}
+
+/// The AbortHandle that aborts on drop
+pub struct AbortOnDropHandle(AbortHandle);
+
+impl Drop for AbortOnDropHandle {
+    fn drop(&mut self) { self.0.abort(); }
+}
+
+/// Spawns the loop that broadcasts message every `interval` seconds returning the AbortOnDropHandle
+/// to stop it
+pub fn broadcast_swap_message_every(ctx: MmArc, topic: String, msg: SwapMsg, interval: f64) -> AbortOnDropHandle {
+    let fut = async move {
+        loop {
+            broadcast_swap_message(&ctx, topic.clone(), msg.clone());
+            Timer::sleep(interval).await;
+        }
+    };
+    let (abortable, abort_handle) = abortable(fut);
+    spawn(abortable.unwrap_or_else(|_| ()));
+    AbortOnDropHandle(abort_handle)
+}
+
+/// Broadcast the swap message once
+pub fn broadcast_swap_message(ctx: &MmArc, topic: String, msg: SwapMsg) {
+    let key_pair = ctx.secp256k1_key_pair.or(&&|| panic!());
+    let encoded_msg = encode_and_sign(&msg, &*key_pair.private().secret).unwrap();
+    broadcast_p2p_msg(ctx, vec![topic], encoded_msg);
+}
+
+pub fn process_msg(ctx: MmArc, topic: &str, msg: &[u8]) {
+    let uuid = match Uuid::from_str(topic) {
+        Ok(u) => u,
+        Err(_) => return,
+    };
+    let msg = match decode_signed::<SwapMsg>(msg) {
+        Ok(m) => m,
+        Err(swap_msg_err) => {
+            match json::from_slice::<SwapStatus>(msg) {
+                Ok(status) => save_stats_swap(&ctx, &status.data).unwrap(),
+                Err(swap_status_err) => {
+                    error!("Couldn't deserialize 'SwapMsg': {:?}", swap_msg_err);
+                    error!("Couldn't deserialize 'SwapStatus': {:?}", swap_status_err);
+                },
+            };
+            return;
+        },
+    };
+    let swap_ctx = SwapsContext::from_ctx(&ctx).unwrap();
+    let mut msgs = swap_ctx.swap_msgs.lock().unwrap();
+    if let Some(msg_store) = msgs.get_mut(&uuid) {
+        if msg_store.accept_only_from.bytes == msg.2.unprefixed() {
+            match msg.0 {
+                SwapMsg::Negotiation(data) => msg_store.negotiation = Some(data),
+                SwapMsg::NegotiationReply(data) => msg_store.negotiation_reply = Some(data),
+                SwapMsg::Negotiated(negotiated) => msg_store.negotiated = Some(negotiated),
+                SwapMsg::TakerFee(taker_fee) => msg_store.taker_fee = Some(taker_fee),
+                SwapMsg::MakerPayment(maker_payment) => msg_store.maker_payment = Some(maker_payment),
+                SwapMsg::TakerPayment(taker_payment) => msg_store.taker_payment = Some(taker_payment),
+            }
+        }
+    }
+}
+
+pub fn swap_topic(uuid: &Uuid) -> String { pub_sub_topic(SWAP_PREFIX, &uuid.to_string()) }
+
+async fn recv_swap_msg<T>(
+    ctx: MmArc,
+    mut getter: impl FnMut(&mut SwapMsgStore) -> Option<T>,
+    uuid: &Uuid,
+    timeout: u64,
+) -> Result<T, String> {
+    let started = now_ms() / 1000;
+    let timeout = BASIC_COMM_TIMEOUT + timeout;
+    let wait_until = started + timeout;
+    loop {
+        Timer::sleep(1.).await;
+        let swap_ctx = SwapsContext::from_ctx(&ctx).unwrap();
+        let mut msgs = swap_ctx.swap_msgs.lock().unwrap();
+        if let Some(msg_store) = msgs.get_mut(uuid) {
+            if let Some(msg) = getter(msg_store) {
+                return Ok(msg);
+            }
+        }
+        let now = now_ms() / 1000;
+        if now > wait_until {
+            return ERR!("Timeout ({} > {})", now - started, timeout);
+        }
+    }
+}
 
 /// Includes the grace time we add to the "normal" timeouts
 /// in order to give different and/or heavy communication channels a chance.
@@ -164,15 +252,17 @@ pub struct RecoveredSwap {
 }
 
 /// Represents the amount of a coin locked by ongoing swap
+#[derive(Debug)]
 pub struct LockedAmount {
     coin: String,
     amount: MmNumber,
+    trade_fee: Option<TradeFee>,
 }
 
 pub trait AtomicSwap: Send + Sync {
-    fn locked_amount(&self, trade_fee: &TradeFee) -> LockedAmount;
+    fn locked_amount(&self) -> Vec<LockedAmount>;
 
-    fn uuid(&self) -> &str;
+    fn uuid(&self) -> &Uuid;
 
     fn maker_coin(&self) -> &str;
 
@@ -186,29 +276,24 @@ pub enum SwapEvent {
     Taker(TakerSwapEvent),
 }
 
-impl Into<SwapEvent> for MakerSwapEvent {
-    fn into(self) -> SwapEvent { SwapEvent::Maker(self) }
+impl From<MakerSwapEvent> for SwapEvent {
+    fn from(maker_event: MakerSwapEvent) -> Self { SwapEvent::Maker(maker_event) }
 }
 
-impl Into<SwapEvent> for TakerSwapEvent {
-    fn into(self) -> SwapEvent { SwapEvent::Taker(self) }
-}
-
-#[derive(Serialize)]
-struct BanReason {
-    caused_by_swap: String,
-    caused_by_event: SwapEvent,
+impl From<TakerSwapEvent> for SwapEvent {
+    fn from(taker_event: TakerSwapEvent) -> Self { SwapEvent::Taker(taker_event) }
 }
 
 struct SwapsContext {
     running_swaps: Mutex<Vec<Weak<dyn AtomicSwap>>>,
     banned_pubkeys: Mutex<HashMap<H256Json, BanReason>>,
-    /// The clonable receiver of multi-consumer async channel awaiting for shutdown_tx.send() to be
+    /// The cloneable receiver of multi-consumer async channel awaiting for shutdown_tx.send() to be
     /// invoked to stop all running swaps.
     /// MM2 is used as static lib on some platforms e.g. iOS so it doesn't run as separate process.
     /// So when stop was invoked the swaps could stay running on shared executors causing
     /// Very unpleasant consequences
     shutdown_rx: async_std_sync::Receiver<()>,
+    swap_msgs: Mutex<HashMap<Uuid, SwapMsgStore>>,
 }
 
 impl SwapsContext {
@@ -219,7 +304,7 @@ impl SwapsContext {
             let mut shutdown_tx = Some(shutdown_tx);
             ctx.on_stop(Box::new(move || {
                 if let Some(shutdown_tx) = shutdown_tx.take() {
-                    log!("on_stop] firing shutdown_tx!");
+                    info!("on_stop] firing shutdown_tx!");
                     spawn(async move {
                         shutdown_tx.send(()).await;
                     });
@@ -232,49 +317,45 @@ impl SwapsContext {
             Ok(SwapsContext {
                 running_swaps: Mutex::new(vec![]),
                 banned_pubkeys: Mutex::new(HashMap::new()),
+                swap_msgs: Mutex::new(HashMap::new()),
                 shutdown_rx,
             })
         })))
     }
-}
 
-pub fn ban_pubkey(ctx: &MmArc, pubkey: H256, swap_uuid: &str, event: SwapEvent) {
-    let ctx = unwrap!(SwapsContext::from_ctx(ctx));
-    let mut banned = unwrap!(ctx.banned_pubkeys.lock());
-    banned.insert(pubkey.into(), BanReason {
-        caused_by_swap: swap_uuid.into(),
-        caused_by_event: event,
-    });
-}
-
-pub fn is_pubkey_banned(ctx: &MmArc, pubkey: &H256Json) -> bool {
-    let ctx = unwrap!(SwapsContext::from_ctx(ctx));
-    let banned = unwrap!(ctx.banned_pubkeys.lock());
-    banned.contains_key(pubkey)
+    pub fn init_msg_store(&self, uuid: Uuid, accept_only_from: bits256) {
+        let store = SwapMsgStore::new(accept_only_from);
+        self.swap_msgs.lock().unwrap().insert(uuid, store);
+    }
 }
 
 /// Get total amount of selected coin locked by all currently ongoing swaps
-pub fn get_locked_amount(ctx: &MmArc, coin: &str, trade_fee: &TradeFee) -> MmNumber {
-    let swap_ctx = unwrap!(SwapsContext::from_ctx(&ctx));
-    let mut swaps = unwrap!(swap_ctx.running_swaps.lock());
-    *swaps = swaps.drain_filter(|swap| swap.upgrade().is_some()).collect();
-    swaps.iter().fold(0.into(), |total, swap| match swap.upgrade() {
-        Some(swap) => {
-            let locked = swap.locked_amount(trade_fee);
+pub fn get_locked_amount(ctx: &MmArc, coin: &str) -> MmNumber {
+    let swap_ctx = SwapsContext::from_ctx(ctx).unwrap();
+    let swap_lock = swap_ctx.running_swaps.lock().unwrap();
+
+    swap_lock
+        .iter()
+        .filter_map(|swap| swap.upgrade())
+        .map(|swap| swap.locked_amount())
+        .flatten()
+        .fold(MmNumber::from(0), |mut total_amount, locked| {
             if locked.coin == coin {
-                &total + &locked.amount
-            } else {
-                total
+                total_amount += locked.amount;
             }
-        },
-        None => total,
-    })
+            if let Some(trade_fee) = locked.trade_fee {
+                if trade_fee.coin == coin && !trade_fee.paid_from_trading_vol {
+                    total_amount += trade_fee.amount;
+                }
+            }
+            total_amount
+        })
 }
 
 /// Get number of currently running swaps
 pub fn running_swaps_num(ctx: &MmArc) -> u64 {
-    let swap_ctx = unwrap!(SwapsContext::from_ctx(&ctx));
-    let swaps = unwrap!(swap_ctx.running_swaps.lock());
+    let swap_ctx = SwapsContext::from_ctx(ctx).unwrap();
+    let swaps = swap_ctx.running_swaps.lock().unwrap();
     swaps.iter().fold(0, |total, swap| match swap.upgrade() {
         Some(_) => total + 1,
         None => total,
@@ -282,32 +363,50 @@ pub fn running_swaps_num(ctx: &MmArc) -> u64 {
 }
 
 /// Get total amount of selected coin locked by all currently ongoing swaps except the one with selected uuid
-fn get_locked_amount_by_other_swaps(ctx: &MmArc, except_uuid: &str, coin: &str, trade_fee: &TradeFee) -> MmNumber {
-    let swap_ctx = unwrap!(SwapsContext::from_ctx(&ctx));
-    let mut swaps = unwrap!(swap_ctx.running_swaps.lock());
-    *swaps = swaps.drain_filter(|swap| swap.upgrade().is_some()).collect();
-    swaps.iter().fold(0.into(), |total, swap| match swap.upgrade() {
-        Some(swap) => {
-            let locked = swap.locked_amount(trade_fee);
-            if locked.coin == coin && swap.uuid() != except_uuid {
-                &total + &locked.amount
-            } else {
-                total
+fn get_locked_amount_by_other_swaps(ctx: &MmArc, except_uuid: &Uuid, coin: &str) -> MmNumber {
+    let swap_ctx = SwapsContext::from_ctx(ctx).unwrap();
+    let swap_lock = swap_ctx.running_swaps.lock().unwrap();
+
+    swap_lock
+        .iter()
+        .filter_map(|swap| swap.upgrade())
+        .filter(|swap| swap.uuid() != except_uuid)
+        .map(|swap| swap.locked_amount())
+        .flatten()
+        .fold(MmNumber::from(0), |mut total_amount, locked| {
+            if locked.coin == coin {
+                total_amount += locked.amount;
             }
-        },
-        None => total,
-    })
+            if let Some(trade_fee) = locked.trade_fee {
+                if trade_fee.coin == coin && !trade_fee.paid_from_trading_vol {
+                    total_amount += trade_fee.amount;
+                }
+            }
+            total_amount
+        })
 }
 
 pub fn active_swaps_using_coin(ctx: &MmArc, coin: &str) -> Result<Vec<Uuid>, String> {
-    let swap_ctx = try_s!(SwapsContext::from_ctx(&ctx));
+    let swap_ctx = try_s!(SwapsContext::from_ctx(ctx));
     let swaps = try_s!(swap_ctx.running_swaps.lock());
     let mut uuids = vec![];
     for swap in swaps.iter() {
         if let Some(swap) = swap.upgrade() {
             if swap.maker_coin() == coin || swap.taker_coin() == coin {
-                uuids.push(try_s!(swap.uuid().parse()))
+                uuids.push(*swap.uuid())
             }
+        }
+    }
+    Ok(uuids)
+}
+
+pub fn active_swaps(ctx: &MmArc) -> Result<Vec<Uuid>, String> {
+    let swap_ctx = try_s!(SwapsContext::from_ctx(ctx));
+    let swaps = try_s!(swap_ctx.running_swaps.lock());
+    let mut uuids = vec![];
+    for swap in swaps.iter() {
+        if let Some(swap) = swap.upgrade() {
+            uuids.push(*swap.uuid())
         }
     }
     Ok(uuids)
@@ -325,14 +424,7 @@ impl SwapConfirmationsSettings {
     pub fn requires_notarization(&self) -> bool { self.maker_coin_nota || self.taker_coin_nota }
 }
 
-fn coin_with_4x_locktime(ticker: &str) -> bool {
-    match ticker {
-        "BCH" => true,
-        "BTG" => true,
-        "SBTC" => true,
-        _ => false,
-    }
-}
+fn coin_with_4x_locktime(ticker: &str) -> bool { matches!(ticker, "BCH" | "BTG" | "SBTC") }
 
 #[derive(Debug)]
 pub enum AtomicLocktimeVersion {
@@ -385,8 +477,23 @@ pub fn lp_atomic_locktime(maker_coin: &str, taker_coin: &str, version: AtomicLoc
     }
 }
 
+fn dex_fee_threshold(min_tx_amount: MmNumber) -> MmNumber {
+    // 0.0001
+    let min_fee = MmNumber::from((1, 10000));
+    if min_fee < min_tx_amount {
+        min_tx_amount
+    } else {
+        min_fee
+    }
+}
+
 fn dex_fee_rate(base: &str, rel: &str) -> MmNumber {
-    if base == "KMD" || rel == "KMD" {
+    let fee_discount_tickers: &[&str] = if cfg!(test) && var("MYCOIN_FEE_DISCOUNT").is_ok() {
+        &["KMD", "MYCOIN"]
+    } else {
+        &["KMD"]
+    };
+    if fee_discount_tickers.contains(&base) || fee_discount_tickers.contains(&rel) {
         // 1/777 - 10%
         BigRational::new(9.into(), 7770.into()).into()
     } else {
@@ -394,15 +501,88 @@ fn dex_fee_rate(base: &str, rel: &str) -> MmNumber {
     }
 }
 
-pub fn dex_fee_amount(base: &str, rel: &str, trade_amount: &MmNumber) -> MmNumber {
+pub fn dex_fee_amount(base: &str, rel: &str, trade_amount: &MmNumber, dex_fee_threshold: &MmNumber) -> MmNumber {
     let rate = dex_fee_rate(base, rel);
-    // 0.0001
-    let min_fee = BigRational::new(1.into(), 10000.into()).into();
     let fee_amount = trade_amount * &rate;
-    if fee_amount < min_fee {
-        min_fee
+    if &fee_amount < dex_fee_threshold {
+        dex_fee_threshold.clone()
     } else {
         fee_amount
+    }
+}
+
+pub fn dex_fee_amount_from_taker_coin(taker_coin: &MmCoinEnum, maker_coin: &str, trade_amount: &MmNumber) -> MmNumber {
+    let min_tx_amount = MmNumber::from(taker_coin.min_tx_amount());
+    let dex_fee_threshold = dex_fee_threshold(min_tx_amount);
+    dex_fee_amount(taker_coin.ticker(), maker_coin, trade_amount, &dex_fee_threshold)
+}
+
+#[derive(Clone, Debug, Eq, Deserialize, PartialEq, Serialize)]
+pub struct NegotiationDataV1 {
+    started_at: u64,
+    payment_locktime: u64,
+    secret_hash: [u8; 20],
+    persistent_pubkey: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, Deserialize, PartialEq, Serialize)]
+pub struct NegotiationDataV2 {
+    started_at: u64,
+    payment_locktime: u64,
+    secret_hash: Vec<u8>,
+    persistent_pubkey: Vec<u8>,
+    maker_coin_swap_contract: Vec<u8>,
+    taker_coin_swap_contract: Vec<u8>,
+}
+
+#[derive(Clone, Debug, Eq, Deserialize, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum NegotiationDataMsg {
+    V1(NegotiationDataV1),
+    V2(NegotiationDataV2),
+}
+
+impl NegotiationDataMsg {
+    pub fn started_at(&self) -> u64 {
+        match self {
+            NegotiationDataMsg::V1(v1) => v1.started_at,
+            NegotiationDataMsg::V2(v2) => v2.started_at,
+        }
+    }
+
+    pub fn payment_locktime(&self) -> u64 {
+        match self {
+            NegotiationDataMsg::V1(v1) => v1.payment_locktime,
+            NegotiationDataMsg::V2(v2) => v2.payment_locktime,
+        }
+    }
+
+    pub fn secret_hash(&self) -> &[u8] {
+        match self {
+            NegotiationDataMsg::V1(v1) => &v1.secret_hash,
+            NegotiationDataMsg::V2(v2) => &v2.secret_hash,
+        }
+    }
+
+    pub fn persistent_pubkey(&self) -> &[u8] {
+        match self {
+            NegotiationDataMsg::V1(v1) => &v1.persistent_pubkey,
+            NegotiationDataMsg::V2(v2) => &v2.persistent_pubkey,
+        }
+    }
+
+    pub fn maker_coin_swap_contract(&self) -> Option<&[u8]> {
+        match self {
+            NegotiationDataMsg::V1(_) => None,
+            NegotiationDataMsg::V2(v2) => Some(&v2.maker_coin_swap_contract),
+        }
+    }
+
+    pub fn taker_coin_swap_contract(&self) -> Option<&[u8]> {
+        match self {
+            NegotiationDataMsg::V1(_) => None,
+            NegotiationDataMsg::V2(v2) => Some(&v2.taker_coin_swap_contract),
+        }
     }
 }
 
@@ -423,9 +603,40 @@ pub struct TransactionIdentifier {
     tx_hash: BytesJson,
 }
 
-fn my_swaps_dir(ctx: &MmArc) -> PathBuf { ctx.dbdir().join("SWAPS").join("MY") }
+pub fn my_swaps_dir(ctx: &MmArc) -> PathBuf { ctx.dbdir().join("SWAPS").join("MY") }
 
-pub fn my_swap_file_path(ctx: &MmArc, uuid: &str) -> PathBuf { my_swaps_dir(ctx).join(format!("{}.json", uuid)) }
+pub fn my_swap_file_path(ctx: &MmArc, uuid: &Uuid) -> PathBuf { my_swaps_dir(ctx).join(format!("{}.json", uuid)) }
+
+#[cfg(not(target_arch = "wasm32"))]
+pub fn insert_new_swap_to_db(
+    ctx: &MmArc,
+    my_coin: &str,
+    other_coin: &str,
+    uuid: &str,
+    started_at: &str,
+) -> Result<(), String> {
+    crate::mm2::database::my_swaps::insert_new_swap(ctx, my_coin, other_coin, uuid, started_at)
+        .map_err(|e| ERRL!("{}", e))
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn insert_new_swap_to_db(
+    _ctx: &MmArc,
+    _my_coin: &str,
+    _other_coin: &str,
+    _uuid: &str,
+    _started_at: &str,
+) -> Result<(), String> {
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn add_swap_to_db_index(ctx: &MmArc, swap: &SavedSwap) {
+    crate::mm2::database::stats_swaps::add_swap_to_index(&ctx.sqlite_connection(), swap)
+}
+
+#[cfg(target_arch = "wasm32")]
+fn add_swap_to_db_index(_ctx: &MmArc, _swap: &SavedSwap) {}
 
 fn save_stats_swap(ctx: &MmArc, swap: &SavedSwap) -> Result<(), String> {
     let (path, content) = match &swap {
@@ -439,12 +650,13 @@ fn save_stats_swap(ctx: &MmArc, swap: &SavedSwap) -> Result<(), String> {
         ),
     };
     try_s!(write(&path, &content));
+    add_swap_to_db_index(ctx, swap);
     Ok(())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type")]
-enum SavedSwap {
+pub enum SavedSwap {
     Maker(MakerSavedSwap),
     Taker(TakerSavedSwap),
 }
@@ -453,11 +665,11 @@ enum SavedSwap {
 /// They won't have to parse the events themselves handling possible errors, index out of bounds etc.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MySwapInfo {
-    my_coin: String,
-    other_coin: String,
+    pub my_coin: String,
+    pub other_coin: String,
     my_amount: BigDecimal,
     other_amount: BigDecimal,
-    started_at: u64,
+    pub started_at: u64,
 }
 
 impl SavedSwap {
@@ -468,28 +680,28 @@ impl SavedSwap {
         }
     }
 
-    fn uuid(&self) -> &str {
+    pub fn uuid(&self) -> &Uuid {
         match self {
             SavedSwap::Maker(swap) => &swap.uuid,
             SavedSwap::Taker(swap) => &swap.uuid,
         }
     }
 
-    fn maker_coin_ticker(&self) -> Result<String, String> {
+    pub fn maker_coin_ticker(&self) -> Result<String, String> {
         match self {
             SavedSwap::Maker(swap) => swap.maker_coin(),
             SavedSwap::Taker(swap) => swap.maker_coin(),
         }
     }
 
-    fn taker_coin_ticker(&self) -> Result<String, String> {
+    pub fn taker_coin_ticker(&self) -> Result<String, String> {
         match self {
             SavedSwap::Maker(swap) => swap.taker_coin(),
             SavedSwap::Taker(swap) => swap.taker_coin(),
         }
     }
 
-    fn get_my_info(&self) -> Option<MySwapInfo> {
+    pub fn get_my_info(&self) -> Option<MySwapInfo> {
         match self {
             SavedSwap::Maker(swap) => swap.get_my_info(),
             SavedSwap::Taker(swap) => swap.get_my_info(),
@@ -498,14 +710,16 @@ impl SavedSwap {
 
     fn recover_funds(self, ctx: MmArc) -> Result<RecoveredSwap, String> {
         let maker_ticker = try_s!(self.maker_coin_ticker());
-        let maker_coin = match lp_coinfind(&ctx, &maker_ticker) {
+        // Should remove `block_on` when recover_funds is async.
+        let maker_coin = match block_on(lp_coinfind(&ctx, &maker_ticker)) {
             Ok(Some(c)) => c,
             Ok(None) => return ERR!("Coin {} is not activated", maker_ticker),
             Err(e) => return ERR!("Error {} on {} coin find attempt", e, maker_ticker),
         };
 
         let taker_ticker = try_s!(self.taker_coin_ticker());
-        let taker_coin = match lp_coinfind(&ctx, &taker_ticker) {
+        // Should remove `block_on` when recover_funds is async.
+        let taker_coin = match block_on(lp_coinfind(&ctx, &taker_ticker)) {
             Ok(Some(c)) => c,
             Ok(None) => return ERR!("Coin {} is not activated", taker_ticker),
             Err(e) => return ERR!("Error {} on {} coin find attempt", e, taker_ticker),
@@ -540,17 +754,46 @@ impl SavedSwap {
     }
 }
 
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct SavedTradeFee {
+    coin: String,
+    amount: BigDecimal,
+    #[serde(default)]
+    paid_from_trading_vol: bool,
+}
+
+impl From<SavedTradeFee> for TradeFee {
+    fn from(orig: SavedTradeFee) -> Self {
+        // used to calculate locked amount so paid_from_trading_vol doesn't matter here
+        TradeFee {
+            coin: orig.coin,
+            amount: orig.amount.into(),
+            paid_from_trading_vol: orig.paid_from_trading_vol,
+        }
+    }
+}
+
+impl From<TradeFee> for SavedTradeFee {
+    fn from(orig: TradeFee) -> Self {
+        SavedTradeFee {
+            coin: orig.coin,
+            amount: orig.amount.into(),
+            paid_from_trading_vol: orig.paid_from_trading_vol,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
 pub struct SwapError {
     error: String,
 }
 
-impl Into<SwapError> for String {
-    fn into(self) -> SwapError { SwapError { error: self } }
+impl From<String> for SwapError {
+    fn from(error: String) -> Self { SwapError { error } }
 }
 
-impl Into<SwapError> for &str {
-    fn into(self) -> SwapError { SwapError { error: self.into() } }
+impl From<&str> for SwapError {
+    fn from(e: &str) -> Self { SwapError { error: e.to_owned() } }
 }
 
 #[derive(Serialize)]
@@ -573,10 +816,8 @@ impl<'a> From<&'a SavedSwap> for MySwapStatusResponse<'a> {
 
 /// Returns the status of swap performed on `my` node
 pub fn my_swap_status(ctx: MmArc, req: Json) -> HyRes {
-    let uuid = try_h!(req["params"]["uuid"]
-        .as_str()
-        .ok_or("uuid parameter is not set or is not string"));
-    let path = my_swap_file_path(&ctx, uuid);
+    let uuid: Uuid = try_h!(json::from_value(req["params"]["uuid"].clone()));
+    let path = my_swap_file_path(&ctx, &uuid);
     let content = try_h!(slurp(&path));
     if content.is_empty() {
         return rpc_response(
@@ -597,11 +838,9 @@ pub fn my_swap_status(ctx: MmArc, req: Json) -> HyRes {
 
 /// Returns the status of requested swap, typically performed by other nodes and saved by `save_stats_swap_status`
 pub fn stats_swap_status(ctx: MmArc, req: Json) -> HyRes {
-    let uuid = try_h!(req["params"]["uuid"]
-        .as_str()
-        .ok_or("uuid parameter is not set or is not string"));
-    let maker_path = stats_maker_swap_file_path(&ctx, uuid);
-    let taker_path = stats_taker_swap_file_path(&ctx, uuid);
+    let uuid: Uuid = try_h!(json::from_value(req["params"]["uuid"].clone()));
+    let maker_path = stats_maker_swap_file_path(&ctx, &uuid);
+    let taker_path = stats_taker_swap_file_path(&ctx, &uuid);
     let maker_content = try_h!(slurp(&maker_path));
     let taker_content = try_h!(slurp(&taker_path));
     let maker_status: Option<MakerSavedSwap> = if maker_content.is_empty() {
@@ -638,8 +877,14 @@ pub fn stats_swap_status(ctx: MmArc, req: Json) -> HyRes {
     )
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+struct SwapStatus {
+    method: String,
+    data: SavedSwap,
+}
+
 /// Broadcasts `my` swap status to P2P network
-fn broadcast_my_swap_status(uuid: &str, ctx: &MmArc) -> Result<(), String> {
+fn broadcast_my_swap_status(uuid: &Uuid, ctx: &MmArc) -> Result<(), String> {
     let path = my_swap_file_path(ctx, uuid);
     let content = try_s!(slurp(&path));
     let mut status: SavedSwap = try_s!(json::from_slice(&content));
@@ -648,62 +893,98 @@ fn broadcast_my_swap_status(uuid: &str, ctx: &MmArc) -> Result<(), String> {
         SavedSwap::Maker(ref mut swap) => swap.hide_secret(),
     };
     try_s!(save_stats_swap(ctx, &status));
-    let status = json!({
-        "method": "swapstatus",
-        "data": status,
-    });
-    ctx.broadcast_p2p_msg(P2PMessage::from_serialize_with_default_addr(&status));
+    let status = SwapStatus {
+        method: "swapstatus".into(),
+        data: status,
+    };
+    let msg = json::to_vec(&status).expect("Swap status ser should never fail");
+    broadcast_p2p_msg(ctx, vec![swap_topic(uuid)], msg);
     Ok(())
 }
 
-/// Saves the swap status notification received from P2P network to local DB.
-pub fn save_stats_swap_status(ctx: &MmArc, data: Json) -> HyRes {
-    let swap: SavedSwap = try_h!(json::from_value(data));
-    try_h!(save_stats_swap(ctx, &swap));
+#[derive(Debug, Deserialize)]
+pub struct MySwapsFilter {
+    pub my_coin: Option<String>,
+    pub other_coin: Option<String>,
+    pub from_timestamp: Option<u64>,
+    pub to_timestamp: Option<u64>,
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn all_swaps_uuids_by_filter(_ctx: MmArc, _req: Json) -> HyRes {
+    Box::new(futures01::future::err::<Response<Vec<u8>>, String>(ERRL!(
+        "'all_swaps_uuids_by_filter' is only supported in native mode yet"
+    )))
+}
+
+// TODO: Should return the result from SQL like in order history. So it can be clear the exact started_at time
+// and the coins if they are not included in the filter request
+/// Returns *all* uuids of swaps, which match the selected filter.
+#[cfg(not(target_arch = "wasm32"))]
+pub fn all_swaps_uuids_by_filter(ctx: MmArc, req: Json) -> HyRes {
+    use crate::mm2::database::my_swaps::select_uuids_by_my_swaps_filter;
+
+    let filter: MySwapsFilter = try_h!(json::from_value(req));
+    let db_result = try_h!(select_uuids_by_my_swaps_filter(&ctx.sqlite_connection(), &filter, None));
+
     rpc_response(
         200,
         json!({
-            "result": "success"
+            "result": {
+                "uuids": db_result.uuids,
+                "my_coin": filter.my_coin,
+                "other_coin": filter.other_coin,
+                "from_timestamp": filter.from_timestamp,
+                "to_timestamp": filter.to_timestamp,
+                "found_records": db_result.uuids.len(),
+            },
         })
         .to_string(),
     )
 }
 
-/// Returns the data of recent swaps of `my` node. Returns no more than `limit` records (default: 10).
-/// Skips the first `skip` records (default: 0).
+#[cfg(not(target_arch = "wasm32"))]
+#[derive(Debug, Deserialize)]
+pub struct MyRecentSwapsReq {
+    #[serde(flatten)]
+    paging_options: PagingOptions,
+    #[serde(flatten)]
+    filter: MySwapsFilter,
+}
+
+#[cfg(target_arch = "wasm32")]
+pub fn my_recent_swaps(_ctx: MmArc, _req: Json) -> HyRes {
+    Box::new(futures01::future::err::<Response<Vec<u8>>, String>(ERRL!(
+        "'my_recent_swaps' is only supported in native mode yet"
+    )))
+}
+
+/// Returns the data of recent swaps of `my` node.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn my_recent_swaps(ctx: MmArc, req: Json) -> HyRes {
-    let limit = req["limit"].as_u64().unwrap_or(10);
-    let from_uuid = req["from_uuid"].as_str();
-    let mut entries: Vec<(u64, PathBuf)> = try_h!(read_dir(&my_swaps_dir(&ctx)));
-    // sort by m_time in descending order
-    entries.sort_by(|(a, _), (b, _)| b.cmp(&a));
+    use crate::mm2::database::my_swaps::select_uuids_by_my_swaps_filter;
 
-    let skip = match from_uuid {
-        Some(uuid) => {
-            let swap_path = my_swap_file_path(&ctx, uuid);
-            try_h!(entries
-                .iter()
-                .position(|(_, path)| *path == swap_path)
-                .ok_or(format!("from_uuid {} swap is not found", uuid)))
-                + 1
-        },
-        None => 0,
-    };
+    let req: MyRecentSwapsReq = try_h!(json::from_value(req));
+    let db_result = try_h!(select_uuids_by_my_swaps_filter(
+        &ctx.sqlite_connection(),
+        &req.filter,
+        Some(&req.paging_options),
+    ));
 
-    // iterate over file entries trying to parse the file contents and add to result vector
-    let swaps: Vec<Json> = entries
+    // iterate over uuids trying to parse the corresponding files content and add to result vector
+    let swaps: Vec<Json> = db_result
+        .uuids
         .iter()
-        .skip(skip)
-        .take(limit as usize)
-        .map(
-            |(_, path)| match json::from_slice::<SavedSwap>(&unwrap!(slurp(&path))) {
-                Ok(swap) => unwrap!(json::to_value(MySwapStatusResponse::from(&swap))),
+        .map(|uuid| {
+            let path = my_swap_file_path(&ctx, uuid);
+            match json::from_slice::<SavedSwap>(&slurp(&path).unwrap()) {
+                Ok(swap) => json::to_value(MySwapStatusResponse::from(&swap)).unwrap(),
                 Err(e) => {
-                    log!("Error " (e) " parsing JSON from " (path.display()));
+                    error!("Error {} parsing JSON from {}", e, path.display());
                     Json::Null
                 },
-            },
-        )
+            }
+        })
         .collect();
 
     rpc_response(
@@ -711,10 +992,13 @@ pub fn my_recent_swaps(ctx: MmArc, req: Json) -> HyRes {
         json!({
             "result": {
                 "swaps": swaps,
-                "from_uuid": from_uuid,
-                "skipped": skip,
-                "limit": limit,
-                "total": entries.len(),
+                "from_uuid": req.paging_options.from_uuid,
+                "skipped": db_result.skipped,
+                "limit": req.paging_options.limit,
+                "total": db_result.total_count,
+                "page_number": req.paging_options.page_number,
+                "total_pages": calc_total_pages(db_result.total_count, req.paging_options.limit),
+                "found_records": db_result.uuids.len(),
             },
         })
         .to_string(),
@@ -725,7 +1009,8 @@ pub fn my_recent_swaps(ctx: MmArc, req: Json) -> HyRes {
 /// Return the tickers of coins that must be enabled for swaps to continue
 pub fn swap_kick_starts(ctx: MmArc) -> HashSet<String> {
     let mut coins = HashSet::new();
-    let entries: Vec<PathBuf> = unwrap!(read_dir(&my_swaps_dir(&ctx)))
+    let entries: Vec<PathBuf> = read_dir(&my_swaps_dir(&ctx))
+        .unwrap()
         .into_iter()
         .filter_map(|(_lm, path)| {
             if path.extension() == Some(OsStr::new("json")) {
@@ -737,22 +1022,22 @@ pub fn swap_kick_starts(ctx: MmArc) -> HashSet<String> {
         .collect();
 
     entries.iter().for_each(|path| {
-        if let Ok(swap) = json::from_slice::<SavedSwap>(&unwrap!(slurp(&path))) {
+        if let Ok(swap) = json::from_slice::<SavedSwap>(&slurp(&path).unwrap()) {
             if !swap.is_finished() {
-                log!("Kick starting the swap "(swap.uuid()));
+                info!("Kick starting the swap {}", swap.uuid());
                 let maker_coin_ticker = match swap.maker_coin_ticker() {
                     Ok(t) => t,
                     Err(e) => {
-                        log!("Error " (e) " getting maker coin of swap " (swap.uuid()));
+                        error!("Error {} getting maker coin of swap: {}", e, swap.uuid());
                         return;
-                    }
+                    },
                 };
                 let taker_coin_ticker = match swap.taker_coin_ticker() {
                     Ok(t) => t,
                     Err(e) => {
-                        log!("Error " (e) " getting taker coin of swap " (swap.uuid()));
+                        error!("Error {} getting taker coin of swap {}", e, swap.uuid());
                         return;
-                    }
+                    },
                 };
                 coins.insert(maker_coin_ticker.clone());
                 coins.insert(taker_coin_ticker.clone());
@@ -760,47 +1045,61 @@ pub fn swap_kick_starts(ctx: MmArc) -> HashSet<String> {
                     let ctx = ctx.clone();
                     move || {
                         let taker_coin = loop {
-                            match lp_coinfind(&ctx, &taker_coin_ticker) {
+                            match block_on(lp_coinfind(&ctx, &taker_coin_ticker)) {
                                 Ok(Some(c)) => break c,
                                 Ok(None) => {
-                                    log!("Can't kickstart the swap " (swap.uuid()) " until the coin " (taker_coin_ticker) " is activated");
+                                    info!(
+                                        "Can't kickstart the swap {} until the coin {} is activated",
+                                        swap.uuid(),
+                                        taker_coin_ticker
+                                    );
                                     thread::sleep(Duration::from_secs(5));
-                                }
+                                },
                                 Err(e) => {
-                                    log!("Error " (e) " on " (taker_coin_ticker) " find attempt");
+                                    error!("Error {} on {} find attempt", e, taker_coin_ticker);
                                     return;
-                                }
+                                },
                             };
                         };
 
                         let maker_coin = loop {
-                            match lp_coinfind(&ctx, &maker_coin_ticker) {
+                            match block_on(lp_coinfind(&ctx, &maker_coin_ticker)) {
                                 Ok(Some(c)) => break c,
                                 Ok(None) => {
-                                    log!("Can't kickstart the swap " (swap.uuid()) " until the coin " (maker_coin_ticker) " is activated");
+                                    info!(
+                                        "Can't kickstart the swap {} until the coin {} is activated",
+                                        swap.uuid(),
+                                        maker_coin_ticker
+                                    );
                                     thread::sleep(Duration::from_secs(5));
-                                }
+                                },
                                 Err(e) => {
-                                    log!("Error " (e) " on " (maker_coin_ticker) " find attempt");
+                                    error!("Error {} on {} find attempt", e, maker_coin_ticker);
                                     return;
-                                }
+                                },
                             };
                         };
                         match swap {
                             SavedSwap::Maker(saved_swap) => {
-                                block_on(run_maker_swap(RunMakerSwapInput::KickStart {
-                                    maker_coin,
-                                    taker_coin,
-                                    swap_uuid: saved_swap.uuid,
-                                }, ctx));
-                            }
+                                block_on(run_maker_swap(
+                                    RunMakerSwapInput::KickStart {
+                                        maker_coin,
+                                        taker_coin,
+                                        swap_uuid: saved_swap.uuid,
+                                    },
+                                    ctx,
+                                ));
+                            },
                             SavedSwap::Taker(saved_swap) => {
-                                block_on(run_taker_swap(RunTakerSwapInput::KickStart {
-                                    maker_coin,
-                                    taker_coin,
-                                    swap_uuid: saved_swap.uuid,
-                                }, ctx));
-                            }
+                                block_on(run_taker_swap(
+                                    RunTakerSwapInput::KickStart {
+                                        maker_coin,
+                                        taker_coin,
+                                        swap_uuid: saved_swap.uuid,
+                                    },
+                                    ctx,
+                                ));
+                            },
                         }
                     }
                 });
@@ -818,10 +1117,8 @@ pub async fn coins_needed_for_kick_start(ctx: MmArc) -> Result<Response<Vec<u8>>
 }
 
 pub async fn recover_funds_of_swap(ctx: MmArc, req: Json) -> Result<Response<Vec<u8>>, String> {
-    let uuid = try_s!(req["params"]["uuid"]
-        .as_str()
-        .ok_or("uuid parameter is not set or is not string"));
-    let path = my_swap_file_path(&ctx, uuid);
+    let uuid: Uuid = try_s!(json::from_value(req["params"]["uuid"].clone()));
+    let path = my_swap_file_path(&ctx, &uuid);
     let content = try_s!(slurp(&path));
     if content.is_empty() {
         return ERR!("swap data is not found");
@@ -847,7 +1144,20 @@ pub async fn import_swaps(ctx: MmArc, req: Json) -> Result<Response<Vec<u8>>, St
     let mut skipped = HashMap::new();
     for swap in swaps {
         match swap.save_to_db(&ctx) {
-            Ok(_) => imported.push(swap.uuid().to_owned()),
+            Ok(_) => {
+                if let Some(info) = swap.get_my_info() {
+                    if let Err(e) = insert_new_swap_to_db(
+                        &ctx,
+                        &info.my_coin,
+                        &info.other_coin,
+                        &swap.uuid().to_string(),
+                        &info.started_at.to_string(),
+                    ) {
+                        error!("Error {} on new swap insertion", e);
+                    }
+                }
+                imported.push(swap.uuid().to_owned());
+            },
             Err(e) => {
                 skipped.insert(swap.uuid().to_owned(), e);
             },
@@ -862,93 +1172,96 @@ pub async fn import_swaps(ctx: MmArc, req: Json) -> Result<Response<Vec<u8>>, St
     Ok(try_s!(Response::builder().body(res)))
 }
 
-pub async fn list_banned_pubkeys(ctx: MmArc) -> Result<Response<Vec<u8>>, String> {
-    let ctx = try_s!(SwapsContext::from_ctx(&ctx));
-    let res = try_s!(json::to_vec(&json!({
-        "result": *try_s!(ctx.banned_pubkeys.lock()),
-    })));
-    Ok(try_s!(Response::builder().body(res)))
-}
-
 #[derive(Deserialize)]
-#[serde(tag = "type", content = "data")]
-enum UnbanPubkeysReq {
-    All,
-    Few(Vec<H256Json>),
+struct ActiveSwapsReq {
+    #[serde(default)]
+    include_status: bool,
 }
 
-pub async fn unban_pubkeys(ctx: MmArc, req: Json) -> Result<Response<Vec<u8>>, String> {
-    let req: UnbanPubkeysReq = try_s!(json::from_value(req["unban_by"].clone()));
-    let ctx = try_s!(SwapsContext::from_ctx(&ctx));
-    let mut banned_pubs = try_s!(ctx.banned_pubkeys.lock());
-    let mut unbanned = HashMap::new();
-    let mut were_not_banned = vec![];
-    match req {
-        UnbanPubkeysReq::All => {
-            unbanned = banned_pubs.drain().collect();
-        },
-        UnbanPubkeysReq::Few(pubkeys) => {
-            for pubkey in pubkeys {
-                match banned_pubs.remove(&pubkey) {
-                    Some(removed) => {
-                        unbanned.insert(pubkey, removed);
-                    },
-                    None => were_not_banned.push(pubkey),
-                }
+#[derive(Serialize)]
+struct ActiveSwapsRes {
+    uuids: Vec<Uuid>,
+    statuses: Option<HashMap<Uuid, SavedSwap>>,
+}
+
+pub async fn active_swaps_rpc(ctx: MmArc, req: Json) -> Result<Response<Vec<u8>>, String> {
+    let req: ActiveSwapsReq = try_s!(json::from_value(req));
+    let uuids = try_s!(active_swaps(&ctx));
+    let statuses = if req.include_status {
+        let mut map = HashMap::new();
+        for uuid in uuids.iter() {
+            let path = my_swap_file_path(&ctx, uuid);
+            let content = match slurp(&path) {
+                Ok(c) => c,
+                Err(e) => {
+                    error!("Error {} on slurp({})", e, path.display());
+                    continue;
+                },
+            };
+            if content.is_empty() {
+                continue;
             }
-        },
-    }
-    let res = try_s!(json::to_vec(&json!({
-        "result": {
-            "still_banned": *banned_pubs,
-            "unbanned": unbanned,
-            "were_not_banned": were_not_banned,
-        },
-    })));
+            let status: SavedSwap = match json::from_slice(&content) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("Error {} on deserializing the content {:?}", e, content);
+                    continue;
+                },
+            };
+            map.insert(*uuid, status);
+        }
+        Some(map)
+    } else {
+        None
+    };
+    let result = ActiveSwapsRes { uuids, statuses };
+    let res = try_s!(json::to_vec(&result));
     Ok(try_s!(Response::builder().body(res)))
 }
 
 #[cfg(test)]
 mod lp_swap_tests {
-    use super::*;
     use serialization::{deserialize, serialize};
+
+    use super::*;
 
     #[test]
     fn test_dex_fee_amount() {
+        let dex_fee_threshold = MmNumber::from("0.0001");
+
         let base = "BTC";
         let rel = "ETH";
         let amount = 1.into();
-        let actual_fee = dex_fee_amount(base, rel, &amount);
+        let actual_fee = dex_fee_amount(base, rel, &amount, &dex_fee_threshold);
         let expected_fee = amount / 777u64.into();
         assert_eq!(expected_fee, actual_fee);
 
         let base = "KMD";
         let rel = "ETH";
         let amount = 1.into();
-        let actual_fee = dex_fee_amount(base, rel, &amount);
+        let actual_fee = dex_fee_amount(base, rel, &amount, &dex_fee_threshold);
         let expected_fee = amount * (9, 7770).into();
         assert_eq!(expected_fee, actual_fee);
 
         let base = "BTC";
         let rel = "KMD";
         let amount = 1.into();
-        let actual_fee = dex_fee_amount(base, rel, &amount);
+        let actual_fee = dex_fee_amount(base, rel, &amount, &dex_fee_threshold);
         let expected_fee = amount * (9, 7770).into();
         assert_eq!(expected_fee, actual_fee);
 
         let base = "BTC";
         let rel = "KMD";
-        let amount: MmNumber = unwrap!("0.001".parse::<BigDecimal>()).into();
-        let actual_fee = dex_fee_amount(base, rel, &amount);
-        let expected_fee: MmNumber = unwrap!("0.0001".parse::<BigDecimal>()).into();
-        assert_eq!(expected_fee, actual_fee);
+        let amount: MmNumber = "0.001".parse::<BigDecimal>().unwrap().into();
+        let actual_fee = dex_fee_amount(base, rel, &amount, &dex_fee_threshold);
+        assert_eq!(dex_fee_threshold, actual_fee);
     }
 
     #[test]
     fn test_serde_swap_negotiation_data() {
         let data = SwapNegotiationData::default();
         let bytes = serialize(&data);
-        let deserialized = unwrap!(deserialize(bytes.as_slice()));
+        let deserialized = deserialize(bytes.as_slice()).unwrap();
         assert_eq!(data, deserialized);
     }
 
@@ -1121,5 +1434,68 @@ mod lp_swap_tests {
         let expected = PAYMENT_LOCKTIME * 10;
         let actual = lp_atomic_locktime(maker_coin, taker_coin, AtomicLocktimeVersion::V1);
         assert_eq!(expected, actual);
+    }
+
+    #[test]
+    fn check_negotiation_data_serde() {
+        // old message format should be deserialized to NegotiationDataMsg::V1
+        let v1 = NegotiationDataV1 {
+            started_at: 0,
+            payment_locktime: 0,
+            secret_hash: [0; 20],
+            persistent_pubkey: vec![1; 33],
+        };
+
+        let expected = NegotiationDataMsg::V1(NegotiationDataV1 {
+            started_at: 0,
+            payment_locktime: 0,
+            secret_hash: [0; 20],
+            persistent_pubkey: vec![1; 33],
+        });
+
+        let serialized = rmp_serde::to_vec(&v1).unwrap();
+
+        let deserialized: NegotiationDataMsg = rmp_serde::from_read_ref(serialized.as_slice()).unwrap();
+
+        assert_eq!(deserialized, expected);
+
+        // new message format should be deserialized to old
+        let v2 = NegotiationDataMsg::V2(NegotiationDataV2 {
+            started_at: 0,
+            payment_locktime: 0,
+            secret_hash: vec![0; 20],
+            persistent_pubkey: vec![1; 33],
+            maker_coin_swap_contract: vec![1; 20],
+            taker_coin_swap_contract: vec![1; 20],
+        });
+
+        let expected = NegotiationDataV1 {
+            started_at: 0,
+            payment_locktime: 0,
+            secret_hash: [0; 20],
+            persistent_pubkey: vec![1; 33],
+        };
+
+        let serialized = rmp_serde::to_vec(&v2).unwrap();
+
+        let deserialized: NegotiationDataV1 = rmp_serde::from_read_ref(serialized.as_slice()).unwrap();
+
+        assert_eq!(deserialized, expected);
+
+        // new message format should be deserialized to new
+        let v2 = NegotiationDataMsg::V2(NegotiationDataV2 {
+            started_at: 0,
+            payment_locktime: 0,
+            secret_hash: vec![0; 20],
+            persistent_pubkey: vec![1; 33],
+            maker_coin_swap_contract: vec![1; 20],
+            taker_coin_swap_contract: vec![1; 20],
+        });
+
+        let serialized = rmp_serde::to_vec(&v2).unwrap();
+
+        let deserialized: NegotiationDataMsg = rmp_serde::from_read_ref(serialized.as_slice()).unwrap();
+
+        assert_eq!(deserialized, v2);
     }
 }

@@ -10,8 +10,6 @@ trigger:
   branches:
     include:
       - refs/heads/*
-    exclude:
-      - refs/heads/qrc20
   paths:
     exclude:
       - README.md
@@ -53,7 +51,7 @@ stages:
 
   - stage: Release
     displayName: Release
-    condition: and(eq(variables['build.sourceBranch'], 'refs/heads/mm2'), succeeded('Build'))
+    condition: and(eq(variables['build.sourceBranch'], 'refs/heads/mm2.1'), succeeded('Build'))
     jobs:
       - template: azure-pipelines-release-stage-job.yml  # Template reference
         parameters:

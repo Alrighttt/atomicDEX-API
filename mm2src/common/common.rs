@@ -10,23 +10,23 @@
 //!                     |
 //!                   binary
 
-#![feature(non_ascii_idents, integer_atomics, panic_info_message)]
+#![allow(uncommon_codepoints)]
+#![feature(integer_atomics, panic_info_message)]
 #![feature(async_closure)]
 #![feature(hash_raw_entry)]
-#![feature(optin_builtin_traits)]
+#![feature(negative_impls)]
+#![feature(auto_traits)]
 #![feature(drain_filter)]
-#![feature(const_fn)]
-#![allow(uncommon_codepoints)]
-#![cfg_attr(not(feature = "native"), allow(unused_imports))]
-#![cfg_attr(not(feature = "native"), allow(dead_code))]
 
 #[macro_use] extern crate arrayref;
 #[macro_use] extern crate fomat_macros;
 #[macro_use] extern crate gstuff;
 #[macro_use] extern crate lazy_static;
-#[macro_use] extern crate serde_derive;
-#[macro_use] extern crate serde_json;
-#[macro_use] extern crate unwrap;
+#[macro_use] pub extern crate serde_derive;
+#[macro_use] pub extern crate serde_json;
+#[cfg(test)]
+#[macro_use]
+extern crate ser_error_derive;
 
 /// Fills a C character array with a zero-terminated C string,
 /// returning an error if the string is too large.
@@ -58,6 +58,28 @@ macro_rules! ifrom {
     };
 }
 
+#[macro_export]
+macro_rules! cfg_wasm32 {
+    ($($tokens:tt)*) => {
+        cfg_if::cfg_if! {
+            if #[cfg(target_arch = "wasm32")] {
+                $($tokens)*
+            }
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! cfg_native {
+    ($($tokens:tt)*) => {
+        cfg_if::cfg_if! {
+            if #[cfg(not(target_arch = "wasm32"))] {
+                $($tokens)*
+            }
+        }
+    };
+}
+
 #[macro_use]
 pub mod jsonrpc_client;
 #[macro_use]
@@ -66,82 +88,85 @@ pub mod log;
 pub mod mm_metrics;
 
 pub mod big_int_str;
+pub mod crash_reports;
 pub mod custom_futures;
 pub mod duplex_mutex;
 pub mod file_lock;
-#[cfg(feature = "native")] pub mod for_c;
-pub mod header;
+#[cfg(not(target_arch = "wasm32"))] pub mod for_c;
 pub mod iguana_utils;
 pub mod mm_ctx;
+#[path = "mm_error/mm_error.rs"] pub mod mm_error;
 pub mod mm_number;
 pub mod privkey;
 pub mod seri;
+#[path = "patterns/state_machine.rs"] pub mod state_machine;
 
-#[cfg(feature = "native")] pub mod lift_body;
-#[cfg(not(feature = "native"))]
-pub mod lift_body {
-    #[derive(Debug)]
-    pub struct LiftBody<T> {
-        inner: T,
-    }
-}
+#[cfg(target_arch = "wasm32")] pub mod wasm_indexed_db;
+#[cfg(target_arch = "wasm32")] pub mod wasm_rpc;
+#[cfg(target_arch = "wasm32")]
+#[path = "transport/wasm_ws.rs"]
+pub mod wasm_ws;
 
-use atomic::Atomic;
 use bigdecimal::BigDecimal;
-#[cfg(all(feature = "native", not(windows)))]
-use findshlibs::{IterationControl, Segment, SharedLibrary, TargetSharedLibrary};
 use futures::compat::Future01CompatExt;
 use futures::future::FutureExt;
 use futures::task::Waker;
-#[cfg(not(feature = "native"))]
-use futures::task::{Context, Poll as Poll03};
 use futures01::{future, task::Task, Future};
 use gstuff::binprint;
 use hex::FromHex;
 use http::header::{HeaderValue, CONTENT_TYPE};
 use http::{HeaderMap, Request, Response, StatusCode};
-#[cfg(feature = "native")] use libc::{free, malloc};
 use parking_lot::{Mutex as PaMutex, MutexGuard as PaMutexGuard};
 use rand::{rngs::SmallRng, SeedableRng};
 use serde::{de, ser};
-#[cfg(not(feature = "native"))]
-use serde_bencode::de::from_bytes as bdecode;
 use serde_bytes::ByteBuf;
 use serde_json::{self as json, Value as Json};
 use std::collections::HashMap;
-use std::env::{self, args};
 use std::ffi::{CStr, OsStr};
 use std::fmt::{self, Write as FmtWrite};
 use std::fs;
 use std::fs::DirEntry;
 use std::future::Future as Future03;
-use std::intrinsics::copy;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::mem::{forget, size_of, zeroed};
 use std::net::SocketAddr;
 use std::ops::{Add, Deref, Div, RangeInclusive};
 use std::os::raw::{c_char, c_void};
 use std::path::{Path, PathBuf};
-#[cfg(not(feature = "native"))] use std::pin::Pin;
 use std::ptr::read_volatile;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::UNIX_EPOCH;
 use uuid::Uuid;
-#[cfg(feature = "w-bindgen")] use wasm_bindgen::prelude::*;
 
-pub use num_bigint::BigInt;
+pub use serde;
 
-#[cfg(feature = "native")]
-#[allow(dead_code, non_upper_case_globals, non_camel_case_types, non_snake_case)]
-pub mod lp {
-    include!("c_headers/LP_include.rs");
+cfg_native! {
+    pub use gstuff::{now_float, now_ms};
+    pub use rusqlite;
+
+    #[cfg(not(windows))]
+    use findshlibs::{IterationControl, Segment, SharedLibrary, TargetSharedLibrary};
+    use libc::{free, malloc};
+    use std::env;
+    use std::io::Read;
 }
 
-pub const MM_DATETIME: &str = env!("MM_DATETIME");
-pub const MM_VERSION: &str = env!("MM_VERSION");
+cfg_wasm32! {
+    use futures::task::{Context, Poll as Poll03};
+    use std::pin::Pin;
+    use wasm_bindgen::prelude::*;
+}
 
 pub const SATOSHIS: u64 = 100_000_000;
+
+pub const DEX_FEE_ADDR_PUBKEY: &str = "03bc2c7ba671bae4a6fc835244c9762b41647b9827d4780a89a949b984a8ddcc06";
+lazy_static! {
+    pub static ref DEX_FEE_ADDR_RAW_PUBKEY: Vec<u8> =
+        hex::decode(DEX_FEE_ADDR_PUBKEY).expect("DEX_FEE_ADDR_PUBKEY is expected to be a hexadecimal string");
+}
+
+pub auto trait NotSame {}
+impl<X> !NotSame for (X, X) {}
 
 /// Converts u64 satoshis to f64
 pub fn sat_to_f(sat: u64) -> f64 { sat as f64 / SATOSHIS as f64 }
@@ -272,15 +297,15 @@ pub const SMALLVAL: f64 = 0.000_000_000_000_001; // 1e-15f64
 /// The difference from `CString` is that the memory is then *owned* by the C code instead of being temporarily borrowed,
 /// that is it doesn't need to be recycled in Rust.
 /// Plus we don't check the slice for zeroes, most of our code doesn't need that extra check.
-#[cfg(feature = "native")]
+#[cfg(not(target_arch = "wasm32"))]
 pub fn str_to_malloc(s: &str) -> *mut c_char { slice_to_malloc(s.as_bytes()) as *mut c_char }
 
 /// Helps sharing a byte slice with C code by allocating a zero-terminated string with the C standard library allocator.
-#[cfg(feature = "native")]
+#[cfg(not(target_arch = "wasm32"))]
 pub fn slice_to_malloc(bytes: &[u8]) -> *mut u8 {
     unsafe {
         let buf = malloc(bytes.len() + 1) as *mut u8;
-        copy(bytes.as_ptr(), buf, bytes.len());
+        std::intrinsics::copy(bytes.as_ptr(), buf, bytes.len());
         *buf.add(bytes.len()) = 0;
         buf
     }
@@ -290,7 +315,6 @@ pub fn slice_to_malloc(bytes: &[u8]) -> *mut u8 {
 /// Doesn't free the allocated memory
 /// It's responsibility of the caller to free the memory when required
 /// Returns error in case of null pointer input
-#[cfg(feature = "native")]
 #[allow(clippy::missing_safety_doc)]
 pub unsafe fn c_char_to_string(ptr: *mut c_char) -> Result<String, String> {
     if !ptr.is_null() {
@@ -304,7 +328,7 @@ pub unsafe fn c_char_to_string(ptr: *mut c_char) -> Result<String, String> {
 
 /// Frees C raw pointer
 /// Does nothing in case of null pointer input
-#[cfg(feature = "native")]
+#[cfg(not(target_arch = "wasm32"))]
 pub fn free_c_ptr(ptr: *mut c_void) {
     unsafe {
         if !ptr.is_null() {
@@ -354,10 +378,7 @@ pub fn stack_trace_frame(instr_ptr: *mut c_void, buf: &mut dyn Write, symbol: &b
         },
         None => "??".into(),
     };
-    let lineno = match symbol.lineno() {
-        Some(lineno) => lineno,
-        None => 0,
-    };
+    let lineno = symbol.lineno().unwrap_or(0);
     let name = match symbol.name() {
         Some(name) => name,
         None => SymbolName::new(&[]),
@@ -436,11 +457,13 @@ pub fn stack_trace(
         true
     });
 
-    #[cfg(all(feature = "native", not(windows)))]
+    // not(wasm) and not(windows)
+    #[cfg(not(any(target_arch = "wasm32", windows)))]
     output_pc_mem_addr(output)
 }
 
-#[cfg(all(feature = "native", not(windows)))]
+// not(wasm) and not(windows)
+#[cfg(not(any(target_arch = "wasm32", windows)))]
 fn output_pc_mem_addr(output: &mut dyn FnMut(&str)) {
     TargetSharedLibrary::each(|shlib| {
         let mut trace_buf = trace_buf();
@@ -472,11 +495,11 @@ fn output_pc_mem_addr(output: &mut dyn FnMut(&str)) {
 /// handlers print only "unknown" in Android backtraces which is not helpful.
 /// Using custom hook with patched backtrace version solves this issue.
 /// NB: https://github.com/rust-lang/backtrace-rs/issues/227
-#[cfg(feature = "native")]
+#[cfg(not(target_arch = "wasm32"))]
 pub fn set_panic_hook() {
     use std::panic::{set_hook, PanicInfo};
 
-    thread_local! {static ENTERED: Atomic<bool> = Atomic::new (false);}
+    thread_local! {static ENTERED: AtomicBool = AtomicBool::new(false);}
 
     set_hook(Box::new(|info: &PanicInfo| {
         // Stack tracing and logging might panic (in `println!` for example).
@@ -539,7 +562,7 @@ pub fn is_a_test_drill() -> bool {
         return false;
     }
 
-    if let Some(executable) = args().next() {
+    if let Some(executable) = std::env::args().next() {
         if executable.ends_with(r"\mm2.exe") {
             return false;
         }
@@ -551,12 +574,16 @@ pub fn is_a_test_drill() -> bool {
     true
 }
 
-pub type SlurpFut = Box<dyn Future<Item = (StatusCode, HeaderMap, Vec<u8>), Error = String> + Send + 'static>;
+pub type SlurpRes = Result<(StatusCode, HeaderMap, Vec<u8>), String>;
 
 /// RPC response, returned by the RPC handlers.  
 /// NB: By default the future is executed on the shared asynchronous reactor (`CORE`),
 /// the handler is responsible for spawning the future on another reactor if it doesn't fit the `CORE` well.
 pub type HyRes = Box<dyn Future<Item = Response<Vec<u8>>, Error = String> + Send>;
+
+pub trait HttpStatusCode {
+    fn status_code(&self) -> StatusCode;
+}
 
 #[derive(Debug, Deserialize, Serialize)]
 struct HostedHttpRequest {
@@ -578,21 +605,13 @@ struct HostedHttpResponse {
 // wio stands for "web I/O" or "wasm I/O",
 // it contains the parts which aren't directly available with WASM.
 
-#[cfg(not(feature = "native"))]
+#[cfg(target_arch = "wasm32")]
 pub mod wio {
-    use super::SlurpFut;
-    use futures::channel::oneshot::{channel, Receiver, Sender};
-    use futures::compat::Compat;
-    use futures::future::FutureExt;
-    use futures::lock::Mutex;
-    use futures01::future::IntoFuture;
+    use super::SlurpRes;
     use http::header::{HeaderName, HeaderValue};
-    use http::{HeaderMap, Method, Request, StatusCode};
-    use rand::Rng;
+    use http::{HeaderMap, Request, StatusCode};
     use serde_bencode::de::from_bytes as bdecode;
     use serde_bencode::ser::to_bytes as bencode;
-    use std::collections::HashMap;
-    use std::os::raw::c_char;
     use std::str::FromStr;
 
     pub async fn slurp_reqʹ(request: Request<Vec<u8>>) -> Result<(StatusCode, HeaderMap, Vec<u8>), String> {
@@ -635,50 +654,48 @@ pub mod wio {
         Ok((status, headers, hhres.body))
     }
 
-    pub fn slurp_req(request: Request<Vec<u8>>) -> SlurpFut { Box::new(Compat::new(Box::pin(slurp_reqʹ(request)))) }
+    pub async fn slurp_req(request: Request<Vec<u8>>) -> SlurpRes { slurp_reqʹ(request).await }
 }
 
-#[cfg(feature = "native")]
+#[cfg(not(target_arch = "wasm32"))]
 pub mod wio {
-    use crate::lift_body::LiftBody;
-    use crate::SlurpFut;
-    use bytes::Bytes;
+    use crate::SlurpRes;
     use futures::compat::Future01CompatExt;
     use futures::executor::ThreadPool;
     use futures01::sync::oneshot::{self, Receiver};
     use futures01::{Async, Future, Poll};
     use futures_cpupool::CpuPool;
     use gstuff::{duration_to_float, now_float};
-    use http::{HeaderMap, Method, Request, StatusCode};
+    use http::{HeaderMap, Request, StatusCode};
     use hyper::client::HttpConnector;
-    use hyper::rt::Stream;
-    use hyper::server::conn::Http;
-    use hyper::Client;
+    use hyper::{Body, Client};
     use hyper_rustls::HttpsConnector;
-    use serde_bencode::de::from_bytes as bdecode;
-    use serde_bencode::ser::to_bytes as bencode;
     use std::fmt;
     use std::sync::Mutex;
     use std::thread::JoinHandle;
     use std::time::Duration;
     use tokio::runtime::Runtime;
 
-    fn start_core_thread() -> Runtime { unwrap!(tokio::runtime::Builder::new().build()) }
+    fn start_core_thread() -> Mm2Runtime { Mm2Runtime(Runtime::new().unwrap()) }
+
+    pub struct Mm2Runtime(pub Runtime);
 
     lazy_static! {
         /// Shared asynchronous reactor.
-        pub static ref CORE: Mutex<Runtime> = Mutex::new (start_core_thread());
+        pub static ref CORE: Mm2Runtime = start_core_thread();
         /// Shared CPU pool to run intensive/sleeping requests on a separate thread.
         ///
         /// Deprecated, prefer the futures 0.3 `POOL` instead.
         pub static ref CPUPOOL: CpuPool = CpuPool::new(8);
         /// Shared CPU pool to run intensive/sleeping requests on s separate thread.
-        pub static ref POOL: Mutex<ThreadPool> = Mutex::new (unwrap! (ThreadPool::builder()
-            .pool_size (8)
-            .name_prefix ("POOL")
-            .create(), "!ThreadPool"));
-        /// Shared HTTP server.
-        pub static ref HTTP: Http = Http::new();
+        pub static ref POOL: Mutex<ThreadPool> = Mutex::new(ThreadPool::builder()
+            .pool_size(8)
+            .name_prefix("POOL")
+            .create().expect("!ThreadPool"));
+    }
+
+    impl<Fut: std::future::Future<Output = ()> + Send + 'static> hyper::rt::Executor<Fut> for &Mm2Runtime {
+        fn execute(&self, fut: Fut) { self.0.spawn(fut); }
     }
 
     /// With a shared reactor drives the future `f` to completion.
@@ -694,10 +711,28 @@ pub mod wio {
         E: Send + 'static,
     {
         let (sx, rx) = oneshot::channel();
-        unwrap!(CORE.lock()).spawn(f.then(move |fr: Result<R, E>| -> Result<(), ()> {
-            let _ = sx.send(fr);
-            Ok(())
-        }));
+        CORE.0.spawn(
+            f.then(move |fr: Result<R, E>| -> Result<(), ()> {
+                let _ = sx.send(fr);
+                Ok(())
+            })
+            .compat(),
+        );
+        rx
+    }
+
+    pub fn drive03<F, O>(f: F) -> futures::channel::oneshot::Receiver<O>
+    where
+        F: std::future::Future<Output = O> + Send + 'static,
+        O: Send + 'static,
+    {
+        let (sx, rx) = futures::channel::oneshot::channel();
+        CORE.0.spawn(async move {
+            let res = f.await;
+            if sx.send(res).is_err() {
+                log!("drive03 receiver is dropped");
+            };
+        });
         rx
     }
 
@@ -752,17 +787,18 @@ pub mod wio {
                         if self.monitor.is_none() {
                             let task = futures01::task::current();
                             let deadline = self.started + self.timeout;
-                            self.monitor = Some(unwrap!(std::thread::Builder::new()
-                                .name("timeout monitor".into())
-                                .spawn(move || {
-                                    loop {
+                            self.monitor = Some(
+                                std::thread::Builder::new()
+                                    .name("timeout monitor".into())
+                                    .spawn(move || loop {
                                         std::thread::sleep(Duration::from_secs(1));
                                         task.notify();
                                         if now_float() > deadline + 2. {
                                             break;
                                         }
-                                    }
-                                })));
+                                    })
+                                    .unwrap(),
+                            );
                         }
                         Ok(Async::NotReady)
                     }
@@ -792,11 +828,11 @@ pub mod wio {
 
     lazy_static! {
         /// NB: With a shared client there is a possibility that keep-alive connections will be reused.
-        pub static ref HYPER: Client<HttpsConnector<HttpConnector>, LiftBody<Vec<u8>>> = {
-            let dns_threads = 2;
-            let https = HttpsConnector::new (dns_threads);
+        pub static ref HYPER: Client<HttpsConnector<HttpConnector>> = {
+            // Please note there was a problem on iOS if [`HttpsConnector::with_native_roots`] is used instead.
+            let https = HttpsConnector::with_webpki_roots();
             Client::builder()
-                .executor (unwrap! (CORE.lock()) .executor())
+                .executor(&*CORE)
                 // Hyper had a lot of Keep-Alive bugs over the years and I suspect
                 // that with the shared client we might be getting errno 10054
                 // due to a closed Keep-Alive connection mismanagement.
@@ -807,80 +843,27 @@ pub mod wio {
                 // ourselves with a custom connector or something).
                 // Performance of Keep-Alive in the Hyper client is questionable as well,
                 // should measure it on a case-by-case basis when we need it.
-                .keep_alive (false)
-                .build (https)
+                .pool_max_idle_per_host(0)
+                .build(https)
         };
     }
 
     /// Executes a Hyper request, returning the response status, headers and body.
-    pub fn slurp_req(request: Request<Vec<u8>>) -> SlurpFut {
+    pub async fn slurp_req(request: Request<Vec<u8>>) -> SlurpRes {
         let (head, body) = request.into_parts();
-        let request = Request::from_parts(head, LiftBody::from(body));
+        let request = Request::from_parts(head, Body::from(body));
 
-        let uri = fomat!((request.uri()));
         let request_f = HYPER.request(request);
-        let response_f = request_f.then(move |res| -> SlurpFut {
-            // Can fail with:
-            // "an IO error occurred: An existing connection was forcibly closed by the remote host. (os error 10054)" (on Windows)
-            // "an error occurred trying to connect: No connection could be made because the target machine actively refused it. (os error 10061)"
-            // "an error occurred trying to connect: Connection refused (os error 111)"
-            let res = match res {
-                Ok(r) => r,
-                Err(err) => return Box::new(futures01::future::err(ERRL!("Error accessing '{}': {}", uri, err))),
-            };
-            let status = res.status();
-            let headers = res.headers().clone();
-            let body = res.into_body();
-            let body_f = body.concat2();
-            let combined_f = body_f.then(move |body| -> Result<(StatusCode, HeaderMap, Vec<u8>), String> {
-                let body = try_s!(body);
-                Ok((status, headers, body.to_vec()))
-            });
-            Box::new(combined_f)
-        });
-        Box::new(drive_s(response_f))
+        let response = try_s!(try_s!(drive03(request_f).await));
+        let status = response.status();
+        let headers = response.headers().clone();
+        let body = response.into_body();
+        let output = try_s!(hyper::body::to_bytes(body).await);
+        Ok((status, headers, output.to_vec()))
     }
 
     pub async fn slurp_reqʹ(request: Request<Vec<u8>>) -> Result<(StatusCode, HeaderMap, Vec<u8>), String> {
-        slurp_req(request).compat().await
-    }
-
-    pub async fn slurp_reqʰ(req: Bytes) -> Result<Vec<u8>, String> {
-        let hhreq: super::HostedHttpRequest = try_s!(bdecode(&req));
-        //log! ("slurp_reqʰ] " [=hhreq]);
-
-        let mut req = Request::builder();
-        req.method(try_s!(Method::from_bytes(hhreq.method.as_bytes())));
-        req.uri(hhreq.uri);
-        for (n, v) in hhreq.headers {
-            req.header(&n[..], &v[..]);
-        }
-        let req = try_s!(req.body(hhreq.body));
-
-        let (status, headers, body) = try_s!(slurp_reqʹ(req).await);
-
-        let hhres = super::HostedHttpResponse {
-            status: status.as_u16(),
-            headers: headers
-                .iter()
-                .filter_map(|(name, value)| {
-                    let name = name.as_str().to_owned();
-                    let v = match value.to_str() {
-                        Ok(ascii) => ascii,
-                        Err(err) => {
-                            log! ("!ascii '" (name) "': " (err));
-                            return None;
-                        },
-                    };
-                    Some((name, v.to_owned()))
-                })
-                .collect(),
-            body,
-        };
-        //log! ("HostedHttpResponse: " [=hhres]);
-
-        let hhres = try_s!(bencode(&hhres));
-        Ok(hhres)
+        slurp_req(request).await
     }
 }
 
@@ -1052,19 +1035,19 @@ pub mod lazy {
     }
 }
 
-#[cfg(feature = "native")]
+#[cfg(not(target_arch = "wasm32"))]
 pub mod executor {
     use futures::task::Context;
-    use futures::{Future as Future03, FutureExt, Poll as Poll03, TryFutureExt};
+    use futures::task::Poll as Poll03;
+    use futures::Future as Future03;
     use gstuff::now_float;
     use std::pin::Pin;
     use std::thread;
     use std::time::Duration;
 
-    pub fn spawn(future: impl Future03<Output = ()> + Send + 'static) {
-        let f = future.unit_error().boxed().compat();
-        unwrap!(crate::wio::CORE.lock()).spawn(f);
-    }
+    pub fn spawn(future: impl Future03<Output = ()> + Send + 'static) { crate::wio::CORE.0.spawn(future); }
+
+    pub fn spawn_boxed(future: Box<dyn Future03<Output = ()> + Send + Unpin + 'static>) { spawn(future); }
 
     /// Schedule the given `future` to be executed shortly after the given `utc` time is reached.
     pub fn spawn_after(utc: f64, future: impl Future03<Output = ()> + Send + 'static) {
@@ -1077,10 +1060,11 @@ pub mod executor {
         static START: Once = Once::new();
         static SCHEDULE: Constructible<channel::Sender<SheduleChannelItem>> = Constructible::new();
         START.call_once(|| {
-            unwrap!(
-                thread::Builder::new().name("spawn_after".into()).spawn(move || {
+            thread::Builder::new()
+                .name("spawn_after".into())
+                .spawn(move || {
                     let (tx, rx) = channel::bounded(0);
-                    unwrap!(SCHEDULE.pin(tx), "spawn_after] Can't pin the channel");
+                    SCHEDULE.pin(tx).expect("spawn_after] Can't pin the channel");
                     type Task = Pin<Box<dyn Future03<Output = ()> + Send + 'static>>;
                     let mut tasks: BTreeMap<Duration, Vec<Task>> = BTreeMap::new();
                     let mut ready = Vec::with_capacity(4);
@@ -1115,9 +1099,8 @@ pub mod executor {
                             .or_insert_with(Vec::new)
                             .push(f)
                     }
-                }),
-                "Can't spawn a spawn_after thread"
-            );
+                })
+                .expect("Can't spawn a spawn_after thread");
         });
         loop {
             match SCHEDULE.as_option() {
@@ -1126,7 +1109,7 @@ pub mod executor {
                     continue;
                 },
                 Some(tx) => {
-                    unwrap!(tx.send((utc, Box::pin(future))), "Can't reach spawn_after");
+                    tx.send((utc, Box::pin(future))).expect("Can't reach spawn_after");
                     break;
                 },
             }
@@ -1177,7 +1160,7 @@ pub mod executor {
     }
 }
 
-#[cfg(not(feature = "native"))] pub mod executor;
+#[cfg(target_arch = "wasm32")] pub mod executor;
 
 /// Returns a JSON error HyRes on a failure.
 #[macro_export]
@@ -1191,45 +1174,40 @@ macro_rules! try_h {
 }
 
 /// Executes a GET request, returning the response status, headers and body.
-pub fn slurp_url(url: &str) -> SlurpFut { wio::slurp_req(try_fus!(Request::builder().uri(url).body(Vec::new()))) }
+pub async fn slurp_url(url: &str) -> SlurpRes {
+    wio::slurp_req(try_s!(Request::builder().uri(url).body(Vec::new()))).await
+}
 
 #[test]
-#[ignore]
 fn test_slurp_req() {
-    let (status, headers, body) = unwrap!(slurp_url("https://httpbin.org/get").wait());
-    assert!(status.is_success(), format!("{:?} {:?} {:?}", status, headers, body));
+    let (status, headers, body) = block_on(slurp_url("https://httpbin.org/get")).unwrap();
+    assert!(status.is_success(), "{:?} {:?} {:?}", status, headers, body);
 }
 
 /// Fetch URL by HTTPS and parse JSON response
-pub fn fetch_json<T>(url: &str) -> Box<dyn Future<Item = T, Error = String>>
+pub async fn fetch_json<T>(url: &str) -> Result<T, String>
 where
     T: serde::de::DeserializeOwned + Send + 'static,
 {
-    Box::new(slurp_url(url).and_then(|result| {
-        // try to parse as json with serde_json
-        let result = try_s!(serde_json::from_slice(&result.2));
-
-        Ok(result)
-    }))
+    let result = try_s!(slurp_url(url).await);
+    let result = try_s!(serde_json::from_slice(&result.2));
+    Ok(result)
 }
 
 /// Send POST JSON HTTPS request and parse response
-pub fn post_json<T>(url: &str, json: String) -> Box<dyn Future<Item = T, Error = String>>
+pub async fn post_json<T>(url: &str, json: String) -> Result<T, String>
 where
     T: serde::de::DeserializeOwned + Send + 'static,
 {
-    let request = try_fus!(Request::builder()
+    let request = try_s!(Request::builder()
         .method("POST")
         .uri(url)
         .header(CONTENT_TYPE, HeaderValue::from_static("application/json"))
         .body(json.into()));
 
-    Box::new(wio::slurp_req(request).and_then(|result| {
-        // try to parse as json with serde_json
-        let result = try_s!(serde_json::from_slice(&result.2));
-
-        Ok(result)
-    }))
+    let result = try_s!(wio::slurp_req(request).await);
+    let result = try_s!(serde_json::from_slice(&result.2));
+    Ok(result)
 }
 
 /// Wraps a JSON string into the `HyRes` RPC response future.
@@ -1243,7 +1221,10 @@ where
         .body(Vec::from(body))
     {
         Ok(r) => future::ok::<Response<Vec<u8>>, String>(r),
-        Err(err) => future::err::<Response<Vec<u8>>, String>(ERRL!("{}", err)),
+        Err(err) => {
+            let err = ERRL!("{}", err);
+            future::err::<Response<Vec<u8>>, String>(json!({ "error": err }).to_string())
+        },
     };
     Box::new(rf)
 }
@@ -1412,15 +1393,6 @@ impl<R: Send + 'static> RefreshedExternalResource<R> {
     }
 }
 
-/// From<io::Error> is required to be implemented by futures-timer timeout.
-/// We can't implement it for String directly due to Rust restrictions.
-/// So this solution looks like simplest at least for now. We have to remap errors to get proper type.
-pub struct StringError(pub String);
-
-impl From<std::io::Error> for StringError {
-    fn from(e: std::io::Error) -> StringError { StringError(ERRL!("{}", e)) }
-}
-
 #[derive(Clone, Debug)]
 pub struct P2PMessage {
     pub from: SocketAddr,
@@ -1452,39 +1424,16 @@ pub struct QueuedCommand {
     // retstrp: *mut *mut c_char,
 }
 
-/// Register an RPC command that came internally or from the peer-to-peer bus.
-pub fn lp_queue_command(ctx: &mm_ctx::MmArc, msg: P2PMessage) -> Result<(), String> {
-    // If we're helping a WASM then leave a copy of the broadcast for them.
-    if let Some(ref mut cq) = *try_s!(ctx.command_queueʰ.lock()) {
-        // Monotonic increment.
-        let now = if let Some(last) = cq.last() {
-            (last.0 + 1).max(now_ms())
-        } else {
-            now_ms()
-        };
-        cq.push((now, msg.clone()))
-    }
-
-    let cmd = QueuedCommand {
-        msg,
-        queue_id: 0,
-        response_sock: -1,
-        stats_json_only: 0,
-    };
-    try_s!(ctx.command_queue.unbounded_send(cmd));
-    Ok(())
-}
-
 pub fn var(name: &str) -> Result<String, String> {
     /// Obtains the environment variable `name` from the host, copying it into `rbuf`.
     /// Returns the length of the value copied to `rbuf` or -1 if there was an error.
-    #[cfg(not(feature = "native"))]
-    #[cfg_attr(feature = "w-bindgen", wasm_bindgen(raw_module = "../../../js/defined-in-js.js"))]
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(raw_module = "../../../js/defined-in-js.js")]
     extern "C" {
         pub fn host_env(name: *const c_char, nameˡ: i32, rbuf: *mut c_char, rcap: i32) -> i32;
     }
 
-    #[cfg(feature = "native")]
+    #[cfg(not(target_arch = "wasm32"))]
     {
         match std::env::var(name) {
             Ok(v) => Ok(v),
@@ -1492,21 +1441,18 @@ pub fn var(name: &str) -> Result<String, String> {
         }
     }
 
-    #[cfg(not(feature = "native"))]
+    #[cfg(target_arch = "wasm32")]
     {
         // Get the environment variable from the host.
-        use std::mem::zeroed;
         use std::str::from_utf8;
 
         let mut buf: [u8; 4096] = unsafe { zeroed() };
-        let rc = unsafe {
-            host_env(
-                name.as_ptr() as *const c_char,
-                name.len() as i32,
-                buf.as_mut_ptr() as *mut c_char,
-                buf.len() as i32,
-            )
-        };
+        let rc = host_env(
+            name.as_ptr() as *const c_char,
+            name.len() as i32,
+            buf.as_mut_ptr() as *mut c_char,
+            buf.len() as i32,
+        );
         if rc <= 0 {
             return ERR!("No {}", name);
         }
@@ -1515,6 +1461,8 @@ pub fn var(name: &str) -> Result<String, String> {
     }
 }
 
+/// TODO make it wasm32 only
+/// #[cfg(not(target_arch = "wasm32"))]
 pub fn block_on<F>(f: F) -> F::Output
 where
     F: Future03,
@@ -1529,27 +1477,21 @@ where
 }
 
 use backtrace::SymbolName;
-#[cfg(feature = "native")] pub use gstuff::{now_float, now_ms};
 
-#[cfg(not(feature = "native"))]
-pub fn now_ms() -> u64 {
-    #[cfg_attr(feature = "w-bindgen", wasm_bindgen(raw_module = "../../../js/defined-in-js.js"))]
-    extern "C" {
-        pub fn date_now() -> f64;
-    }
-    unsafe { date_now() as u64 }
-}
-#[cfg(not(feature = "native"))]
+#[cfg(target_arch = "wasm32")]
+pub fn now_ms() -> u64 { js_sys::Date::now() as u64 }
+
+#[cfg(target_arch = "wasm32")]
 pub fn now_float() -> f64 {
     use gstuff::duration_to_float;
     use std::time::Duration;
     duration_to_float(Duration::from_millis(now_ms()))
 }
 
-#[cfg(feature = "native")]
+#[cfg(not(target_arch = "wasm32"))]
 pub fn slurp(path: &dyn AsRef<Path>) -> Result<Vec<u8>, String> { Ok(gstuff::slurp(path)) }
 
-#[cfg(feature = "native")]
+#[cfg(not(target_arch = "wasm32"))]
 pub fn safe_slurp(path: &dyn AsRef<Path>) -> Result<Vec<u8>, String> {
     let mut file = match std::fs::File::open(path) {
         Ok(f) => f,
@@ -1561,97 +1503,89 @@ pub fn safe_slurp(path: &dyn AsRef<Path>) -> Result<Vec<u8>, String> {
     Ok(buf)
 }
 
-#[cfg(not(feature = "native"))]
+#[cfg(target_arch = "wasm32")]
 pub fn slurp(path: &dyn AsRef<Path>) -> Result<Vec<u8>, String> {
     use std::mem::MaybeUninit;
 
-    #[cfg_attr(feature = "w-bindgen", wasm_bindgen(raw_module = "../../../js/defined-in-js.js"))]
+    #[wasm_bindgen(raw_module = "../../../js/defined-in-js.js")]
     extern "C" {
         pub fn host_slurp(path_p: *const c_char, path_l: i32, rbuf: *mut c_char, rcap: i32) -> i32;
     }
 
     let path = try_s!(path.as_ref().to_str().ok_or("slurp: path not unicode"));
     let mut rbuf: [u8; 262144] = unsafe { MaybeUninit::uninit().assume_init() };
-    let rc = unsafe {
-        host_slurp(
-            path.as_ptr() as *const c_char,
-            path.len() as i32,
-            rbuf.as_mut_ptr() as *mut c_char,
-            rbuf.len() as i32,
-        )
-    };
+    let rc = host_slurp(
+        path.as_ptr() as *const c_char,
+        path.len() as i32,
+        rbuf.as_mut_ptr() as *mut c_char,
+        rbuf.len() as i32,
+    );
     if rc < 0 {
         return ERR!("!host_slurp: {}", rc);
     }
     Ok(Vec::from(&rbuf[..rc as usize]))
 }
 
-#[cfg(feature = "native")]
+#[cfg(not(target_arch = "wasm32"))]
 pub fn temp_dir() -> PathBuf { env::temp_dir() }
 
-#[cfg(not(feature = "native"))]
+#[cfg(target_arch = "wasm32")]
 pub fn temp_dir() -> PathBuf {
-    #[cfg_attr(feature = "w-bindgen", wasm_bindgen(raw_module = "../../../js/defined-in-js.js"))]
+    #[wasm_bindgen(raw_module = "../../../js/defined-in-js.js")]
     extern "C" {
         pub fn temp_dir(rbuf: *mut c_char, rcap: i32) -> i32;
     }
     let mut buf: [u8; 4096] = unsafe { zeroed() };
-    let rc = unsafe { temp_dir(buf.as_mut_ptr() as *mut c_char, buf.len() as i32) };
+    let rc = temp_dir(buf.as_mut_ptr() as *mut c_char, buf.len() as i32);
     if rc <= 0 {
         panic!("!temp_dir")
     }
-    let path = unwrap!(std::str::from_utf8(&buf[0..rc as usize]));
+    let path = std::str::from_utf8(&buf[0..rc as usize]).unwrap();
     Path::new(path).into()
 }
 
-#[cfg(feature = "native")]
+#[cfg(not(target_arch = "wasm32"))]
 pub fn remove_file(path: &dyn AsRef<Path>) -> Result<(), String> {
     try_s!(fs::remove_file(path));
     Ok(())
 }
 
-#[cfg(not(feature = "native"))]
+#[cfg(target_arch = "wasm32")]
 pub fn remove_file(path: &dyn AsRef<Path>) -> Result<(), String> {
-    use std::os::raw::c_char;
-
-    #[cfg_attr(feature = "w-bindgen", wasm_bindgen(raw_module = "../../../js/defined-in-js.js"))]
+    #[wasm_bindgen(raw_module = "../../../js/defined-in-js.js")]
     extern "C" {
         pub fn host_rm(ptr: *const c_char, len: i32) -> i32;
     }
 
     let path = try_s!(path.as_ref().to_str().ok_or("Non-unicode path"));
-    let rc = unsafe { host_rm(path.as_ptr() as *const c_char, path.len() as i32) };
+    let rc = host_rm(path.as_ptr() as *const c_char, path.len() as i32);
     if rc != 0 {
         return ERR!("!host_rm: {}", rc);
     }
     Ok(())
 }
 
-#[cfg(feature = "native")]
+#[cfg(not(target_arch = "wasm32"))]
 pub fn write(path: &dyn AsRef<Path>, contents: &dyn AsRef<[u8]>) -> Result<(), String> {
     try_s!(fs::write(path, contents));
     Ok(())
 }
 
-#[cfg(not(feature = "native"))]
+#[cfg(target_arch = "wasm32")]
 pub fn write(path: &dyn AsRef<Path>, contents: &dyn AsRef<[u8]>) -> Result<(), String> {
-    use std::os::raw::c_char;
-
-    #[cfg_attr(feature = "w-bindgen", wasm_bindgen(raw_module = "../../../js/defined-in-js.js"))]
+    #[wasm_bindgen(raw_module = "../../../js/defined-in-js.js")]
     extern "C" {
         pub fn host_write(path_p: *const c_char, path_l: i32, ptr: *const c_char, len: i32) -> i32;
     }
 
     let path = try_s!(path.as_ref().to_str().ok_or("Non-unicode path"));
     let content = contents.as_ref();
-    let rc = unsafe {
-        host_write(
-            path.as_ptr() as *const c_char,
-            path.len() as i32,
-            content.as_ptr() as *const c_char,
-            content.len() as i32,
-        )
-    };
+    let rc = host_write(
+        path.as_ptr() as *const c_char,
+        path.len() as i32,
+        content.as_ptr() as *const c_char,
+        content.len() as i32,
+    );
     if rc != 0 {
         return ERR!("!host_write: {}", rc);
     }
@@ -1659,8 +1593,10 @@ pub fn write(path: &dyn AsRef<Path>, contents: &dyn AsRef<[u8]>) -> Result<(), S
 }
 
 /// Read a folder and return a list of files with their last-modified ms timestamps.
-#[cfg(feature = "native")]
+#[cfg(not(target_arch = "wasm32"))]
 pub fn read_dir(dir: &dyn AsRef<Path>) -> Result<Vec<(u64, PathBuf)>, String> {
+    use std::time::UNIX_EPOCH;
+
     let entries = try_s!(dir.as_ref().read_dir())
         .filter_map(|dir_entry| {
             let entry = match dir_entry {
@@ -1687,7 +1623,7 @@ pub fn read_dir(dir: &dyn AsRef<Path>) -> Result<Vec<(u64, PathBuf)>, String> {
                 },
             };
 
-            let lm = unwrap!(m_time.duration_since(UNIX_EPOCH), "!duration_since").as_millis();
+            let lm = m_time.duration_since(UNIX_EPOCH).expect("!duration_since").as_millis();
             assert!(lm < u64::max_value() as u128);
             let lm = lm as u64;
 
@@ -1703,25 +1639,23 @@ pub fn read_dir(dir: &dyn AsRef<Path>) -> Result<Vec<(u64, PathBuf)>, String> {
     Ok(entries)
 }
 
-#[cfg(not(feature = "native"))]
+#[cfg(target_arch = "wasm32")]
 pub fn read_dir(dir: &dyn AsRef<Path>) -> Result<Vec<(u64, PathBuf)>, String> {
     use std::mem::MaybeUninit;
 
-    #[cfg_attr(feature = "w-bindgen", wasm_bindgen(raw_module = "../../../js/defined-in-js.js"))]
+    #[wasm_bindgen(raw_module = "../../../js/defined-in-js.js")]
     extern "C" {
         pub fn host_read_dir(path_p: *const c_char, path_l: i32, rbuf: *mut c_char, rcap: i32) -> i32;
     }
 
     let path = try_s!(dir.as_ref().to_str().ok_or("read_dir: dir path not unicode"));
     let mut rbuf: [u8; 262144] = unsafe { MaybeUninit::uninit().assume_init() };
-    let rc = unsafe {
-        host_read_dir(
-            path.as_ptr() as *const c_char,
-            path.len() as i32,
-            rbuf.as_mut_ptr() as *mut c_char,
-            rbuf.len() as i32,
-        )
-    };
+    let rc = host_read_dir(
+        path.as_ptr() as *const c_char,
+        path.len() as i32,
+        rbuf.as_mut_ptr() as *mut c_char,
+        rbuf.len() as i32,
+    );
     if rc <= 0 {
         return ERR!("!host_read_dir: {}", rc);
     }
@@ -1739,6 +1673,7 @@ pub fn read_dir(dir: &dyn AsRef<Path>) -> Result<Vec<(u64, PathBuf)>, String> {
 /// If the `MM_LOG` variable is present then tries to open that file.  
 /// Prints a warning to `stdout` if there's a problem opening the file.  
 /// Returns `None` if `MM_LOG` variable is not present or if the specified path can't be opened.
+#[cfg(not(target_arch = "wasm32"))]
 fn open_log_file() -> Option<fs::File> {
     let mm_log = match var("MM_LOG") {
         Ok(v) => v,
@@ -1760,7 +1695,7 @@ fn open_log_file() -> Option<fs::File> {
     }
 }
 
-#[cfg(feature = "native")]
+#[cfg(not(target_arch = "wasm32"))]
 pub fn writeln(line: &str) {
     use std::panic::catch_unwind;
 
@@ -1784,25 +1719,15 @@ pub fn writeln(line: &str) {
     });
 }
 
-#[cfg(not(feature = "native"))]
-const fn make_tail() -> [u8; 0x10000] { [0; 0x10000] }
+#[cfg(target_arch = "wasm32")]
+static mut PROCESS_LOG_TAIL: [u8; 0x10000] = [0; 0x10000];
 
-#[cfg(not(feature = "native"))]
-static mut PROCESS_LOG_TAIL: [u8; 0x10000] = make_tail();
-#[cfg(not(feature = "native"))]
-static TAIL_CUR: Atomic<usize> = Atomic::new(0);
+#[cfg(target_arch = "wasm32")]
+static TAIL_CUR: AtomicUsize = AtomicUsize::new(0);
 
-#[cfg(all(not(feature = "native"), not(feature = "w-bindgen")))]
-pub fn writeln(line: &str) {
-    use std::ffi::CString;
-
-    extern "C" {
-        pub fn console_log(ptr: *const c_char, len: i32);
-    }
-    let lineᶜ = unwrap!(CString::new(line));
-    unsafe { console_log(lineᶜ.as_ptr(), line.len() as i32) }
-
-    // Keep a tail of the log in RAM for the integration tests.
+/// Keep a tail of the log in RAM for the integration tests.
+#[cfg(target_arch = "wasm32")]
+pub fn append_log_tail(line: &str) {
     unsafe {
         if line.len() < PROCESS_LOG_TAIL.len() {
             let posⁱ = TAIL_CUR.load(Ordering::Relaxed);
@@ -1824,19 +1749,19 @@ pub fn writeln(line: &str) {
     }
 }
 
-#[cfg(all(not(feature = "native"), feature = "w-bindgen"))]
+#[cfg(target_arch = "wasm32")]
 pub fn writeln(line: &str) {
     use web_sys::console;
     console::log_1(&line.into());
+    append_log_tail(line);
 }
 
 /// Set up a panic hook that prints the panic location and the message.  
 /// (The default Rust handler doesn't have the means to print the message.
 ///  Note that we're also getting the stack trace from Node.js and rustfilt).
-#[cfg(not(feature = "native"))]
+#[cfg(target_arch = "wasm32")]
 #[no_mangle]
 pub extern "C" fn set_panic_hook() {
-    use gstuff::filename;
     use std::panic::{set_hook, PanicInfo};
 
     set_hook(Box::new(|info: &PanicInfo| {
@@ -1850,15 +1775,15 @@ pub fn small_rng() -> SmallRng { SmallRng::seed_from_u64(now_ms()) }
 
 /// Ask the WASM host to send HTTP request to the native helpers.
 /// Returns request ID used to wait for the reply.
-#[cfg(not(feature = "native"))]
-#[cfg_attr(feature = "w-bindgen", wasm_bindgen(raw_module = "../../../js/defined-in-js.js"))]
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen(raw_module = "../../../js/defined-in-js.js")]
 extern "C" {
     fn http_helper_if(helper: *const u8, helper_len: i32, payload: *const u8, payload_len: i32, timeout_ms: i32)
         -> i32;
 }
 
-#[cfg(not(feature = "native"))]
-#[cfg_attr(feature = "w-bindgen", wasm_bindgen(raw_module = "../../../js/defined-in-js.js"))]
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen(raw_module = "../../../js/defined-in-js.js")]
 extern "C" {
     /// Check with the WASM host to see if the given HTTP request is ready.
     ///
@@ -1884,9 +1809,9 @@ lazy_static! {
 
 /// WASM host invokes this method to signal the readiness of the HTTP request.
 #[no_mangle]
-#[cfg(not(feature = "native"))]
+#[cfg(target_arch = "wasm32")]
 pub extern "C" fn http_ready(helper_request_id: i32) {
-    let mut helper_requests = unwrap!(HELPER_REQUESTS.lock());
+    let mut helper_requests = HELPER_REQUESTS.lock().unwrap();
     if let Some(waker) = helper_requests.remove(&helper_request_id) {
         waker.wake()
     }
@@ -1908,27 +1833,26 @@ impl fmt::Display for HelperResponse {
     }
 }
 
-#[cfg(not(feature = "native"))]
+#[cfg(target_arch = "wasm32")]
 pub async fn helperᶜ(helper: &'static str, args: Vec<u8>) -> Result<Vec<u8>, String> {
-    let helper_request_id = unsafe {
-        http_helper_if(
-            helper.as_ptr(),
-            helper.len() as i32,
-            args.as_ptr(),
-            args.len() as i32,
-            9999,
-        )
-    };
+    use serde_bencode::de::from_bytes as bdecode;
+
+    let helper_request_id = http_helper_if(
+        helper.as_ptr(),
+        helper.len() as i32,
+        args.as_ptr(),
+        args.len() as i32,
+        9999,
+    );
 
     struct HelperReply {
-        helper: &'static str,
         helper_request_id: i32,
     }
     impl std::future::Future for HelperReply {
         type Output = Result<Vec<u8>, String>;
         fn poll(self: Pin<&mut Self>, cx: &mut Context) -> Poll03<Self::Output> {
             let mut buf: [u8; 65535] = unsafe { std::mem::MaybeUninit::uninit().assume_init() };
-            let rlen = unsafe { http_helper_check(self.helper_request_id, buf.as_mut_ptr(), buf.len() as i32) };
+            let rlen = http_helper_check(self.helper_request_id, buf.as_mut_ptr(), buf.len() as i32);
             if rlen < -1 {
                 // Response is larger than capacity.
                 return Poll03::Ready(ERR!("Helper result is too large ({})", rlen));
@@ -1940,21 +1864,15 @@ pub async fn helperᶜ(helper: &'static str, args: Vec<u8>) -> Result<Vec<u8>, S
             // NB: Need a fresh waker each time `Pending` is returned, to support switching tasks.
             // cf. https://rust-lang.github.io/async-book/02_execution/03_wakeups.html
             let waker = cx.waker().clone();
-            unwrap!(HELPER_REQUESTS.lock()).insert(self.helper_request_id, waker);
+            HELPER_REQUESTS.lock().unwrap().insert(self.helper_request_id, waker);
 
             Poll03::Pending
         }
     }
     impl Drop for HelperReply {
-        fn drop(&mut self) { unwrap!(HELPER_REQUESTS.lock()).remove(&self.helper_request_id); }
+        fn drop(&mut self) { HELPER_REQUESTS.lock().unwrap().remove(&self.helper_request_id); }
     }
-    let rv: Vec<u8> = try_s!(
-        HelperReply {
-            helper,
-            helper_request_id
-        }
-        .await
-    );
+    let rv: Vec<u8> = try_s!(HelperReply { helper_request_id }.await);
     let rv: HelperResponse = try_s!(bdecode(&rv));
     if rv.status != 200 {
         return ERR!("!{}: {}", helper, rv);
@@ -1996,8 +1914,8 @@ impl<T: Copy> OrdRange<T> {
 }
 
 /// Invokes callback `cb_id` in the WASM host, passing a `(ptr,len)` string to it.
-#[cfg(not(feature = "native"))]
-#[cfg_attr(feature = "w-bindgen", wasm_bindgen(raw_module = "../../../js/defined-in-js.js"))]
+#[cfg(target_arch = "wasm32")]
+#[wasm_bindgen(raw_module = "../../../js/defined-in-js.js")]
 extern "C" {
     pub fn call_back(cb_id: i32, ptr: *const c_char, len: i32);
 }
@@ -2048,12 +1966,12 @@ pub fn round_to(bd: &BigDecimal, places: u8) -> String {
 
         if pos < dot {
             //println! ("{}, pos < dot, stopping at pos {}", bds, pos);
-            let mut integer: i64 = unwrap!((&bds[0..=pos]).parse());
+            let mut integer: i64 = (&bds[0..=pos]).parse().unwrap();
             if prev_digit > 5 {
                 if bda[0] == b'-' {
-                    integer = unwrap!(integer.checked_sub(1))
+                    integer = integer.checked_sub(1).unwrap()
                 } else {
-                    integer = unwrap!(integer.checked_add(1))
+                    integer = integer.checked_add(1).unwrap()
                 }
             }
             return format!("{}", integer);
@@ -2109,10 +2027,10 @@ fn test_round_to() {
     assert_eq!(round_to(&BigDecimal::from(-0), 0), "0");
 }
 
-#[cfg(feature = "native")]
+#[cfg(not(target_arch = "wasm32"))]
 pub fn new_uuid() -> Uuid { Uuid::new_v4() }
 
-#[cfg(not(feature = "native"))]
+#[cfg(target_arch = "wasm32")]
 pub fn new_uuid() -> Uuid {
     use rand::RngCore;
     use uuid::{Builder, Variant, Version};
@@ -2126,6 +2044,135 @@ pub fn new_uuid() -> Uuid {
         .set_variant(Variant::RFC4122)
         .set_version(Version::Random)
         .build()
+}
+
+/// Get only the first line of the error.
+/// Generally, the `JsValue` error contains the stack trace of an error.
+/// This function cuts off the stack trace.
+#[cfg(target_arch = "wasm32")]
+pub fn stringify_js_error(error: &JsValue) -> String {
+    format!("{:?}", error)
+        .lines()
+        .next()
+        .map(|e| e.to_owned())
+        .unwrap_or_default()
+}
+
+/// The function helper for the `WasmUnwrapExt`, `WasmUnwrapErrExt` traits.
+#[cfg(target_arch = "wasm32")]
+#[track_caller]
+fn caller_file_line() -> (&'static str, u32) {
+    let location = std::panic::Location::caller();
+    let file = gstuff::filename(location.file());
+    let line = location.line();
+    (file, line)
+}
+
+#[cfg(target_arch = "wasm32")]
+pub trait WasmUnwrapExt<T> {
+    fn unwrap_w(self) -> T;
+    fn expect_w(self, description: &str) -> T;
+}
+
+#[cfg(target_arch = "wasm32")]
+pub trait WasmUnwrapErrExt<E> {
+    fn unwrap_err_w(self) -> E;
+    fn expect_err_w(self, description: &str) -> E;
+}
+
+#[cfg(target_arch = "wasm32")]
+impl<T, E: fmt::Debug> WasmUnwrapExt<T> for Result<T, E> {
+    #[track_caller]
+    fn unwrap_w(self) -> T {
+        match self {
+            Ok(t) => t,
+            Err(e) => {
+                let (file, line) = caller_file_line();
+                let error = format!(
+                    "{}:{}] 'Result::unwrap_w' called on an 'Err' value: {:?}",
+                    file, line, e
+                );
+                wasm_bindgen::throw_str(&error)
+            },
+        }
+    }
+
+    #[track_caller]
+    fn expect_w(self, description: &str) -> T {
+        match self {
+            Ok(t) => t,
+            Err(e) => {
+                let (file, line) = caller_file_line();
+                let error = format!("{}:{}] {}: {:?}", file, line, description, e);
+                wasm_bindgen::throw_str(&error)
+            },
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl<T> WasmUnwrapExt<T> for Option<T> {
+    #[track_caller]
+    fn unwrap_w(self) -> T {
+        match self {
+            Some(t) => t,
+            None => {
+                let (file, line) = caller_file_line();
+                let error = format!("{}:{}] 'Option::unwrap_w' called on a 'None' value", file, line);
+                wasm_bindgen::throw_str(&error)
+            },
+        }
+    }
+
+    #[track_caller]
+    fn expect_w(self, description: &str) -> T {
+        match self {
+            Some(t) => t,
+            None => {
+                let (file, line) = caller_file_line();
+                let error = format!("{}:{}] {}", file, line, description);
+                wasm_bindgen::throw_str(&error)
+            },
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+impl<T: fmt::Debug, E> WasmUnwrapErrExt<E> for Result<T, E> {
+    #[track_caller]
+    fn unwrap_err_w(self) -> E {
+        match self {
+            Ok(t) => {
+                let (file, line) = caller_file_line();
+                let error = format!(
+                    "{}:{}] 'Result::unwrap_err_w' called on an 'Ok' value: {:?}",
+                    file, line, t
+                );
+                wasm_bindgen::throw_str(&error)
+            },
+            Err(e) => e,
+        }
+    }
+
+    #[track_caller]
+    fn expect_err_w(self, description: &str) -> E {
+        match self {
+            Ok(t) => {
+                let (file, line) = caller_file_line();
+                let error = format!("{}:{}] {}: {:?}", file, line, description, t);
+                wasm_bindgen::throw_str(&error)
+            },
+            Err(e) => e,
+        }
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
+#[track_caller]
+pub fn panic_w(description: &str) {
+    let (file, line) = caller_file_line();
+    let error = format!("{}:{}] 'panic_w' called: {:?}", file, line, description);
+    wasm_bindgen::throw_str(&error)
 }
 
 pub fn first_char_to_upper(input: &str) -> String {
@@ -2195,4 +2242,26 @@ fn test_median() {
     let expected = Some(3u32);
     let actual = median(&mut input);
     assert_eq!(expected, actual);
+}
+
+pub fn calc_total_pages(entries_len: usize, limit: usize) -> usize {
+    if limit == 0 {
+        return 0;
+    }
+    let pages_num = entries_len / limit;
+    if entries_len % limit == 0 {
+        pages_num
+    } else {
+        pages_num + 1
+    }
+}
+
+#[test]
+fn test_calc_total_pages() {
+    assert_eq!(0, calc_total_pages(0, 0));
+    assert_eq!(0, calc_total_pages(0, 1));
+    assert_eq!(0, calc_total_pages(0, 100));
+    assert_eq!(1, calc_total_pages(1, 1));
+    assert_eq!(2, calc_total_pages(16, 8));
+    assert_eq!(2, calc_total_pages(15, 8));
 }

@@ -3,7 +3,7 @@ use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
 use std::fmt;
 
 /// BigInt wrapper de/serializable from/to string representation
-#[derive(Clone)]
+#[derive(Clone, Eq, PartialEq)]
 pub struct BigIntStr(BigInt);
 
 impl fmt::Debug for BigIntStr {
@@ -18,8 +18,8 @@ impl From<BigInt> for BigIntStr {
     fn from(num: BigInt) -> BigIntStr { BigIntStr(num) }
 }
 
-impl Into<BigInt> for BigIntStr {
-    fn into(self) -> BigInt { self.0 }
+impl From<BigIntStr> for BigInt {
+    fn from(other: BigIntStr) -> Self { other.0 }
 }
 
 impl Serialize for BigIntStr {

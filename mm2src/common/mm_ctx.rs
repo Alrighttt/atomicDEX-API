@@ -1,36 +1,36 @@
-use bytes::Bytes;
-use crossbeam::{channel, Receiver, Sender};
-use futures::channel::mpsc;
-use futures::compat::Compat;
+use crate::log::{self, LogState};
+use crate::mm_metrics::{MetricsArc, MetricsOps};
+use crate::{bits256, small_rng};
 use gstuff::Constructible;
-#[cfg(not(feature = "native"))] use http::Response;
-use keys::{DisplayLayout, KeyPair, Private};
+use keys::KeyPair;
 use primitives::hash::H160;
 use rand::Rng;
-use serde_bencode::de::from_bytes as bdecode;
-use serde_bencode::ser::to_bytes as bencode;
 use serde_bytes::ByteBuf;
 use serde_json::{self as json, Value as Json};
 use std::any::Any;
 use std::collections::hash_map::{Entry, HashMap};
 use std::collections::HashSet;
 use std::fmt;
-use std::net::IpAddr;
-#[cfg(feature = "native")] use std::net::SocketAddr;
 use std::ops::Deref;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Weak};
 
-use crate::executor::Timer;
-use crate::log::{self, LogState};
-use crate::mm_metrics::{prometheus, MetricsArc};
-use crate::{bits256, block_on, small_rng, P2PMessage, QueuedCommand};
+cfg_wasm32! {
+    use crate::wasm_rpc::WasmRpcSender;
+}
+
+cfg_native! {
+    use crate::executor::Timer;
+    use crate::mm_metrics::prometheus;
+    use rusqlite::Connection;
+    use std::net::{IpAddr, SocketAddr};
+    use std::sync::MutexGuard;
+}
 
 /// Default interval to export and record metrics to log.
 const EXPORT_METRICS_INTERVAL: f64 = 5. * 60.;
 
 type StopListenerCallback = Box<dyn FnMut() -> Result<(), String>>;
-use futures::SinkExt;
 
 /// MarketMaker state, shared between the various MarketMaker threads.
 ///
@@ -73,46 +73,31 @@ pub struct MmCtx {
     pub ffi_handle: Constructible<u32>,
     /// Callbacks to invoke from `fn stop`.
     pub stop_listeners: Mutex<Vec<StopListenerCallback>>,
-    /// The context belonging to the `portfolio` crate: `PortfolioContext`.
-    pub portfolio_ctx: Mutex<Option<Arc<dyn Any + 'static + Send + Sync>>>,
     /// The context belonging to the `ordermatch` mod: `OrdermatchContext`.
     pub ordermatch_ctx: Mutex<Option<Arc<dyn Any + 'static + Send + Sync>>>,
-    /// The context belonging to the `peers` crate: `PeersContext`.
-    pub peers_ctx: Mutex<Option<Arc<dyn Any + 'static + Send + Sync>>>,
-    /// The context belonging to the `http_fallback` mod: `HttpFallbackContext`.
-    pub http_fallback_ctx: Mutex<Option<Arc<dyn Any + 'static + Send + Sync>>>,
+    pub p2p_ctx: Mutex<Option<Arc<dyn Any + 'static + Send + Sync>>>,
+    pub peer_id: Constructible<String>,
     /// The context belonging to the `coins` crate: `CoinsContext`.
     pub coins_ctx: Mutex<Option<Arc<dyn Any + 'static + Send + Sync>>>,
-    /// The context belonging to the `prices` mod: `PricesContext`.
-    pub prices_ctx: Mutex<Option<Arc<dyn Any + 'static + Send + Sync>>>,
-    /// Seednode P2P message bus channel.
-    pub seednode_p2p_channel: Mutex<Vec<mpsc::UnboundedSender<P2PMessage>>>,
-    /// Standard node P2P message bus channel.
-    pub client_p2p_channel: (Sender<Vec<u8>>, Receiver<Vec<u8>>),
-    /// `lp_queue_command` shares messages with `lp_command_q_loop` via this channel.  
-    /// The messages are usually the JSON broadcasts from the seed nodes.
-    pub command_queue: mpsc::UnboundedSender<QueuedCommand>,
-    /// The end of the `command_queue` channel taken by `lp_command_q_loop`.
-    pub command_queueʳ: Mutex<Option<mpsc::UnboundedReceiver<QueuedCommand>>>,
-    /// Broadcast `lp_queue_command` messages saved for WASM.
-    pub command_queueʰ: Mutex<Option<Vec<(u64, P2PMessage)>>>,
     /// RIPEMD160(SHA256(x)) where x is secp256k1 pubkey derived from passphrase.
-    /// Replacement of `lp::G.LP_myrmd160`.
     pub rmd160: Constructible<H160>,
-    /// Seed node IPs, initialized in `fn lp_initpeers`.
-    pub seeds: Mutex<Vec<IpAddr>>,
     /// secp256k1 key pair derived from passphrase.
     /// cf. `key_pair_from_seed`.
-    /// Replacement of `lp::G.LP_privkey`.
     pub secp256k1_key_pair: Constructible<KeyPair>,
     /// Coins that should be enabled to kick start the interrupted swaps and orders.
     pub coins_needed_for_kick_start: Mutex<HashSet<String>>,
     /// The context belonging to the `lp_swap` mod: `SwapsContext`.
     pub swaps_ctx: Mutex<Option<Arc<dyn Any + 'static + Send + Sync>>>,
+    /// The RPC sender forwarding requests to writing part of underlying stream.
+    #[cfg(target_arch = "wasm32")]
+    pub wasm_rpc: Constructible<WasmRpcSender>,
+    #[cfg(not(target_arch = "wasm32"))]
+    pub sqlite_connection: Constructible<Mutex<Connection>>,
+    pub mm_version: String,
 }
+
 impl MmCtx {
     pub fn with_log_state(log: LogState) -> MmCtx {
-        let (command_queue, command_queueʳ) = mpsc::unbounded();
         MmCtx {
             conf: Json::Object(json::Map::new()),
             log: log::LogArc::new(log),
@@ -122,22 +107,19 @@ impl MmCtx {
             stop: Constructible::default(),
             ffi_handle: Constructible::default(),
             stop_listeners: Mutex::new(Vec::new()),
-            portfolio_ctx: Mutex::new(None),
             ordermatch_ctx: Mutex::new(None),
-            peers_ctx: Mutex::new(None),
-            http_fallback_ctx: Mutex::new(None),
+            p2p_ctx: Mutex::new(None),
+            peer_id: Constructible::default(),
             coins_ctx: Mutex::new(None),
-            prices_ctx: Mutex::new(None),
-            seednode_p2p_channel: Mutex::new(Vec::with_capacity(1000)),
-            client_p2p_channel: channel::unbounded(),
-            command_queue,
-            command_queueʳ: Mutex::new(Some(command_queueʳ)),
-            command_queueʰ: Mutex::new(None),
             rmd160: Constructible::default(),
-            seeds: Mutex::new(Vec::new()),
             secp256k1_key_pair: Constructible::default(),
             coins_needed_for_kick_start: Mutex::new(HashSet::new()),
             swaps_ctx: Mutex::new(None),
+            #[cfg(target_arch = "wasm32")]
+            wasm_rpc: Constructible::default(),
+            #[cfg(not(target_arch = "wasm32"))]
+            sqlite_connection: Constructible::default(),
+            mm_version: "".into(),
         }
     }
 
@@ -148,7 +130,7 @@ impl MmCtx {
         self.rmd160.or(&|| &*DEFAULT)
     }
 
-    #[cfg(feature = "native")]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn rpc_ip_port(&self) -> Result<SocketAddr, String> {
         let port = self.conf["rpcport"].as_u64().unwrap_or(7783);
         if port < 1000 {
@@ -198,18 +180,18 @@ impl MmCtx {
         big as u16
     }
 
-    pub fn stop(&self) {
-        if self.stop.pin(true).is_ok() {
-            let mut stop_listeners = unwrap!(self.stop_listeners.lock(), "Can't lock stop_listeners");
-            // NB: It is important that we `drain` the `stop_listeners` rather than simply iterating over them
-            // because otherwise there might be reference counting instances remaining in a listener
-            // that would prevent the contexts from properly `Drop`ping.
-            for mut listener in stop_listeners.drain(..) {
-                if let Err(err) = listener() {
-                    log! ({"MmCtx::stop] Listener error: {}", err})
-                }
+    pub fn stop(&self) -> Result<(), String> {
+        try_s!(self.stop.pin(true));
+        let mut stop_listeners = self.stop_listeners.lock().expect("Can't lock stop_listeners");
+        // NB: It is important that we `drain` the `stop_listeners` rather than simply iterating over them
+        // because otherwise there might be reference counting instances remaining in a listener
+        // that would prevent the contexts from properly `Drop`ping.
+        for mut listener in stop_listeners.drain(..) {
+            if let Err(err) = listener() {
+                log! ({"MmCtx::stop] Listener error: {}", err})
             }
         }
+        Ok(())
     }
 
     /// True if the MarketMaker instance needs to stop.
@@ -218,7 +200,7 @@ impl MmCtx {
     /// Register a callback to be invoked when the MM receives the "stop" request.  
     /// The callback is invoked immediately if the MM is stopped already.
     pub fn on_stop(&self, mut cb: Box<dyn FnMut() -> Result<(), String>>) {
-        let mut stop_listeners = unwrap!(self.stop_listeners.lock(), "Can't lock stop_listeners");
+        let mut stop_listeners = self.stop_listeners.lock().expect("Can't lock stop_listeners");
         if self.stop.copy_or(false) {
             if let Err(err) = cb() {
                 log! ({"MmCtx::on_stop] Listener error: {}", err})
@@ -226,38 +208,6 @@ impl MmCtx {
         } else {
             stop_listeners.push(cb)
         }
-    }
-
-    /// Sends the P2P message to a processing thread
-    #[cfg(feature = "native")]
-    pub fn broadcast_p2p_msg(&self, msg: P2PMessage) {
-        let i_am_seed = self.conf["i_am_seed"].as_bool().unwrap_or(false);
-        if i_am_seed {
-            let mut txs = self.seednode_p2p_channel.lock().unwrap();
-            *txs = txs
-                .drain_filter(|sender| block_on(sender.send(msg.clone())).is_ok())
-                .collect();
-        } else {
-            unwrap!(self.client_p2p_channel.0.send(msg.content.into_bytes()));
-        }
-    }
-
-    #[cfg(not(feature = "native"))]
-    pub fn broadcast_p2p_msg(&self, msg: &str) {
-        use crate::executor::spawn;
-        use crate::{helperᶜ, BroadcastP2pMessageArgs};
-
-        let args = BroadcastP2pMessageArgs {
-            ctx: self.ffi_handle.copy_or(0),
-            msg: msg.into(),
-        };
-        let args = unwrap!(bencode(&args));
-        spawn(async move {
-            let rc = helperᶜ("broadcast_p2p_msg", args).await;
-            if let Err(err) = rc {
-                log!("!broadcast_p2p_msg: "(err))
-            }
-        });
     }
 
     /// Get a reference to the secp256k1 key pair.
@@ -284,13 +234,33 @@ impl MmCtx {
     }
 
     pub fn gui(&self) -> Option<&str> { self.conf["gui"].as_str() }
+
+    pub fn mm_version(&self) -> &str { &self.mm_version }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn init_sqlite_connection(&self) -> Result<(), String> {
+        let sqlite_file_path = self.dbdir().join("MM2.db");
+        log::debug!("Trying to open SQLite database file {}", sqlite_file_path.display());
+        let connection = try_s!(Connection::open(sqlite_file_path));
+        try_s!(self.sqlite_connection.pin(Mutex::new(connection)));
+        Ok(())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn sqlite_connection(&self) -> MutexGuard<Connection> {
+        self.sqlite_connection
+            .or(&|| panic!("sqlite_connection is not initialized"))
+            .lock()
+            .unwrap()
+    }
 }
+
 impl Default for MmCtx {
     fn default() -> Self { Self::with_log_state(LogState::in_memory()) }
 }
 
 // We don't want to send `MmCtx` across threads, it will only obstruct the normal use case
-// (and might result in undefined behavior if there's a C struct or value in the context that is aliased from the various MM threads).
+// (and might result in undefined behaviour if there's a C struct or value in the context that is aliased from the various MM threads).
 // Only the `MmArc` is `Send`.
 // Also, `MmCtx` not being `Send` allows us to easily keep various C pointers on the context,
 // which will likely come useful during the gradual port.
@@ -388,34 +358,6 @@ impl MmArc {
         }
     }
 
-    #[cfg(not(feature = "native"))]
-    pub async fn send_to_helpers(&self) -> Result<(), String> {
-        use crate::helperᶜ;
-
-        let ctxʷ = PortableCtx {
-            conf: try_s!(json::to_string(&self.conf)),
-            secp256k1_key_pair: match self.secp256k1_key_pair.as_option() {
-                Some(k) => ByteBuf::from(k.private().layout()),
-                None => ByteBuf::new(),
-            },
-            ffi_handle: self.ffi_handle.as_option().copied(),
-        };
-        let ctxᵇ = try_s!(bencode(&ctxʷ));
-        let hr = try_s!(helperᶜ("ctx2helpers", ctxᵇ).await);
-
-        // Remember the context ID used by the native helpers in order to simplify consecutive syncs.
-        let ctxⁿ: NativeCtx = try_s!(bdecode(&hr));
-        if let Some(ffi_handle) = self.ffi_handle.as_option().copied() {
-            if ffi_handle != ctxⁿ.ffi_handle {
-                return ERR!("ffi_handle mismatch");
-            }
-        } else {
-            try_s!(self.ffi_handle.pin(ctxⁿ.ffi_handle));
-        }
-
-        Ok(())
-    }
-
     /// Tries getting access to the MM context.  
     /// Fails if an invalid MM context handler is passed (no such context or dropped context).
     pub fn from_ffi_handle(ffi_handle: u32) -> Result<MmArc, String> {
@@ -450,6 +392,14 @@ impl MmArc {
             try_s!(self.metrics.init_with_dashboard(self.log.weak(), interval));
         }
 
+        #[cfg(not(target_arch = "wasm32"))]
+        try_s!(self.spawn_prometheus_exporter());
+
+        Ok(())
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn spawn_prometheus_exporter(&self) -> Result<(), String> {
         let prometheusport = match self.conf["prometheusport"].as_u64() {
             Some(port) => port,
             _ => return Ok(()),
@@ -471,75 +421,10 @@ impl MmArc {
             while !ctx.dropped() {
                 Timer::sleep(0.5).await
             }
-
-            Ok::<_, ()>(())
         };
-        let shutdown_detector = Compat::new(Box::pin(shutdown_detector));
 
         prometheus::spawn_prometheus_exporter(self.metrics.weak(), address, shutdown_detector, credentials)
     }
-}
-
-/// Receives a subset of a portable context in order to recreate a native copy of it.  
-/// Can be invoked with the same context multiple times, synchronizing some of the fields.  
-/// As of now we're expecting a one-to-one pairing between the portable and the native versions of MM
-/// so the uniqueness of the `ffi_handle` is not a concern yet.
-#[cfg(feature = "native")]
-pub async fn ctx2helpers(main_ctx: MmArc, req: Bytes) -> Result<Vec<u8>, String> {
-    let ctxʷ: PortableCtx = try_s!(bdecode(&req));
-    let private = try_s!(Private::from_layout(&ctxʷ.secp256k1_key_pair[..]));
-    let main_key = try_s!(main_ctx.secp256k1_key_pair.as_option().ok_or("No key"));
-
-    if *main_key.private() == private {
-        // We have a match with the primary native context, the one configured on the command line.
-        let res = try_s!(bencode(&NativeCtx {
-            ffi_handle: try_s!(main_ctx.ffi_handle())
-        }));
-        return Ok(res);
-    }
-
-    if let Some(ffi_handle) = ctxʷ.ffi_handle {
-        if let Ok(ctx) = MmArc::from_ffi_handle(ffi_handle) {
-            let key = try_s!(ctx.secp256k1_key_pair.as_option().ok_or("No key"));
-            if *key.private() != private {
-                return ERR!("key mismatch");
-            }
-            let res = try_s!(bencode(&NativeCtx {
-                ffi_handle: try_s!(ctx.ffi_handle())
-            }));
-            return Ok(res);
-        }
-    }
-
-    // Create a native copy of the portable context.
-
-    let pair: Option<KeyPair> = if ctxʷ.secp256k1_key_pair.is_empty() {
-        None
-    } else {
-        let private = try_s!(Private::from_layout(&ctxʷ.secp256k1_key_pair[..]));
-        Some(try_s!(KeyPair::from_private(private)))
-    };
-
-    let ctx = MmCtx {
-        conf: try_s!(json::from_str(&ctxʷ.conf)),
-        secp256k1_key_pair: pair.into(),
-        ffi_handle: ctxʷ.ffi_handle.into(),
-        ..MmCtx::with_log_state(LogState::in_memory())
-    };
-    let ctx = MmArc(Arc::new(ctx));
-    if let Some(ffi_handle) = ctxʷ.ffi_handle {
-        let mut ctx_ffi = try_s!(MM_CTX_FFI.lock());
-        if ctx_ffi.contains_key(&ffi_handle) {
-            return ERR!("ID race");
-        }
-        ctx_ffi.insert(ffi_handle, ctx.weak());
-    }
-    let res = try_s!(bencode(&NativeCtx {
-        ffi_handle: try_s!(ctx.ffi_handle())
-    }));
-    Arc::into_raw(ctx.0); // Leak.
-
-    Ok(res)
 }
 
 /// Helps getting a crate context from a corresponding `MmCtx` field.
@@ -571,6 +456,7 @@ where
 pub struct MmCtxBuilder {
     conf: Option<Json>,
     key_pair: Option<KeyPair>,
+    version: String,
 }
 
 impl MmCtxBuilder {
@@ -586,6 +472,11 @@ impl MmCtxBuilder {
         self
     }
 
+    pub fn with_version(mut self, version: String) -> Self {
+        self.version = version;
+        self
+    }
+
     pub fn into_mm_arc(self) -> MmArc {
         // NB: We avoid recreating LogState
         // in order not to interfere with the integration tests checking LogState drop on shutdown.
@@ -595,13 +486,14 @@ impl MmCtxBuilder {
             LogState::in_memory()
         };
         let mut ctx = MmCtx::with_log_state(log);
+        ctx.mm_version = self.version;
         if let Some(conf) = self.conf {
             ctx.conf = conf
         }
 
         if let Some(key_pair) = self.key_pair {
-            unwrap!(ctx.rmd160.pin(key_pair.public().address_hash()));
-            unwrap!(ctx.secp256k1_key_pair.pin(key_pair));
+            ctx.rmd160.pin(key_pair.public().address_hash()).unwrap();
+            ctx.secp256k1_key_pair.pin(key_pair).unwrap();
         }
 
         MmArc(Arc::new(ctx))
