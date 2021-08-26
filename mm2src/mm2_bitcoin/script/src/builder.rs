@@ -4,6 +4,8 @@ use bytes::Bytes;
 use keys::{AddressHash, Public};
 use {Num, Opcode, Script};
 
+use cryptoconditions::condition::Condition;
+
 /// Script builder
 #[derive(Default)]
 pub struct Builder {
@@ -44,6 +46,24 @@ impl Builder {
         Builder::default()
             .push_opcode(Opcode::OP_0)
             .push_bytes(&**address)
+            .into_script()
+    }
+
+    /// Builds a v1 p2cc script pubkey
+    pub fn build_p2cc(cond: &Condition) -> Script {
+        Builder::default()
+            .push_bytes(&*cond.encode_condition())
+            .push_opcode(Opcode::OP_CHECKCRYPTOCONDITION)
+            .into_script()
+    }
+
+    /// Builds a v2 p2cc script pubkey
+    pub fn build_p2cc_mixed(cond: &Condition) -> Script {
+        let mut inner :Vec<u8> = cond.encode_fulfillment(0x01).expect("failed to encode fulfillment");
+        inner.insert(0, 0x4d); // 'M' mixed mode
+        Builder::default()
+            .push_bytes(&*inner)
+            .push_opcode(Opcode::OP_CHECKCRYPTOCONDITION)
             .into_script()
     }
 

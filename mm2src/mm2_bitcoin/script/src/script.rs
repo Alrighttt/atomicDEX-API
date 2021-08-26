@@ -880,4 +880,93 @@ OP_ADD
         }
         assert_eq!(max_idx, 3);
     }
+
+    use cryptoconditions::condition::{Condition, Eval, Secp256k1, Threshold, threshold_to_anon};
+    use libsecp256k1::PublicKey;
+    use rustc_hex::FromHex;
+
+    #[test]
+    fn test_cc_bare_eval_spk() {
+        let cond = Eval { code: vec![0xe4] };
+        let script = Builder::build_p2cc(&cond);
+
+        // komodo-cli -ac_name=BS createrawtransaction '[]' '{"condition":{"amount":1,"type":"eval-sha-256","code":"5A"}}'
+        let known_script: Script =
+            "29af2780205e1effe9b7bab73dce628ccd9f0cbbb16c1e6efc6c4f311e59992a467bc119fd8103100000cc".into();
+
+        assert_eq!(script, known_script);
+    }
+
+    #[test]
+    fn test_cc_bare_secp256k1_spk() {
+        let pk = "020000000000000000000000000000000000000000000000000000000000000001".from_hex::<Vec<u8>>().unwrap();
+        let cond = Secp256k1 {
+                        pubkey: PublicKey::parse_slice(&pk, None).unwrap(),
+                        signature: None
+                    };
+        let script = Builder::build_p2cc(&cond);
+
+        // komodo-cli -ac_name=BS createrawtransaction '[]' '{"condition":{"amount":1,"type":"secp256k1-sha-256","publicKey":"020000000000000000000000000000000000000000000000000000000000000001"}}'
+        let known_script: Script =
+            "29a5278020be27009dbdbb73f3e5a3ebef3d7860d6ef91bb29df9337f568c66890a9d26c9b8103020000cc".into();
+
+        assert_eq!(script, known_script);
+    }
+
+    #[test]
+    fn test_cc_threshold_eval_spk() {
+        let pk = "020000000000000000000000000000000000000000000000000000000000000001".from_hex::<Vec<u8>>().unwrap();
+        let cond = Threshold {
+            threshold: 2,
+            subconditions: vec![
+                Threshold {
+                    threshold: 1,
+                    subconditions: vec![
+                        Secp256k1 {
+                            pubkey: PublicKey::parse_slice(&pk, None).unwrap(),
+                            signature: None
+                        }
+                    ]
+                },
+                Eval { code: vec![0xe4] }
+            ]
+        };
+
+        let script = Builder::build_p2cc(&cond);
+
+        // komodo-cli -ac_name=BS createrawtransaction '[]' '{"condition":{"amount":1,"type":"threshold-sha-256","threshold":2,"subfulfillments":[{"type":"eval-sha-256","code":"5A"},{"type":"threshold-sha-256","threshold":1,"subfulfillments":[{"type":"secp256k1-sha-256","publicKey":"020000000000000000000000000000000000000000000000000000000000000001"}]}]}}'
+        let known_script: Script =
+            "2ea22c8020ced5c2d47ca6e5e360a7daeeed88404d9220098626a5c78a328654af0f0843158103120c008203000401cc".into();
+
+        assert_eq!(script, known_script);
+    }
+
+    #[test]
+    fn test_cc_mixed_threshold_eval_spk() {
+        let pk = "032fd27f72591b02f13a7f9701246eb0296b2be7cfdad32c520e594844ec3d4801".from_hex::<Vec<u8>>().unwrap();
+        let mut cond = Threshold {
+            threshold: 2,
+            subconditions: vec![
+                Eval { code: vec![0xf5] },
+                Threshold {
+                    threshold: 1,
+                    subconditions: vec![
+                        Secp256k1 {
+                            pubkey: PublicKey::parse_slice(&pk, None).unwrap(),
+                            signature: None
+                        }
+                    ]
+                }
+            ]
+        };
+        threshold_to_anon(&mut cond);
+
+        let script = Builder::build_p2cc_mixed(&cond);
+
+        // komodo-cli -ac_name=BS decoderawtransaction $(komodo-cli -ac_name=BS tokenv2create NAME 10 DESC | jq -r .hex) | jq -r .vout\[0].scriptPubKey.hex
+        let known_script: Script =
+            "3e4da23ba00aa003800102af038001f5a12da22b802096fec31e85a06720706ef9214c9c8b2df26940aac250e1d80f23a772b18b5a4a810302040082020204cc".into();
+
+        assert_eq!(script, known_script);
+    }
 }

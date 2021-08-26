@@ -12,3 +12,6 @@ serde = "1.0"
 serialization = { path = "../serialization" }
 log = "0.4"
 blake2b_simd = "0.5"
+cryptoconditions = { git = "https://github.com/alrighttt/cryptoconditions-js.git", commit = "6723ee2d" }
+rustc-hex = "2.1.0"
+libsecp256k1 = "0.6.0"

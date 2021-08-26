@@ -6,6 +6,9 @@ extern crate log;
 extern crate primitives;
 extern crate serde;
 extern crate serialization as ser;
+extern crate cryptoconditions;
+extern crate libsecp256k1;
+extern crate rustc_hex;
 
 mod builder;
 mod error;

@@ -220,6 +220,10 @@ pub enum Opcode {
     OP_CALL = 0xc2,
     OP_SPEND = 0xc3,
     OP_SENDER = 0xc4,
+
+
+    OP_CHECKCRYPTOCONDITION = 0xcc,
+    OP_CHECKCRYPTOCONDITIONVERIFY = 0xcd,
 }
 
 impl fmt::Display for Opcode {
