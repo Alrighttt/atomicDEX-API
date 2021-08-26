@@ -881,6 +881,7 @@ OP_ADD
         assert_eq!(max_idx, 3);
     }
 
+    // could move these elsewhere
     use cryptoconditions::condition::{Condition, Eval, Secp256k1, Threshold, threshold_to_anon};
     use libsecp256k1::PublicKey;
     use rustc_hex::FromHex;
