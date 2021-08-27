@@ -445,6 +445,9 @@ impl Opcode {
             0xc2 => Some(OP_CALL),
             0xc3 => Some(OP_SPEND),
             0xc4 => Some(OP_SENDER),
+
+            0xcc => Some(OP_CHECKCRYPTOCONDITION),
+            0xcd => Some(OP_CHECKCRYPTOCONDITIONVERIFY),
             _ => None,
         }
     }
