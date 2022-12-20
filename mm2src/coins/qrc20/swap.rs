@@ -1,5 +1,6 @@
 use super::history::TransferHistoryBuilder;
 use super::*;
+use bitcrypto::ripemd160;
 use script_pubkey::{extract_contract_addr_from_script, extract_contract_call_from_script, is_contract_call};
 
 /// `erc20Payment` call details consist of values obtained from [`TransactionOutput::script_pubkey`] and [`TxReceipt::logs`].
@@ -38,6 +39,12 @@ impl Qrc20Coin {
         receiver_addr: H160,
         swap_contract_address: H160,
     ) -> Result<TransactionEnum, TransactionErr> {
+        let secret_hash = if secret_hash.len() == 32 {
+            ripemd160(&secret_hash).to_vec()
+        } else {
+            secret_hash
+        };
+
         let balance = try_tx_s!(self.my_spendable_balance().compat().await);
         let balance = try_tx_s!(wei_from_big_decimal(&balance, self.utxo.decimals));
 
@@ -113,46 +120,54 @@ impl Qrc20Coin {
         secret_hash: Vec<u8>,
         amount: BigDecimal,
         expected_swap_contract_address: H160,
-    ) -> Result<(), String> {
+    ) -> Result<(), MmError<ValidatePaymentError>> {
         let expected_swap_id = qrc20_swap_id(time_lock, &secret_hash);
-        let status = try_s!(
-            self.payment_status(&expected_swap_contract_address, expected_swap_id.clone())
-                .await
-        );
+        let status = self
+            .payment_status(&expected_swap_contract_address, expected_swap_id.clone())
+            .await?;
         if status != eth::PAYMENT_STATE_SENT.into() {
-            return ERR!("Payment state is not PAYMENT_STATE_SENT, got {}", status);
+            return MmError::err(ValidatePaymentError::UnexpectedPaymentState(format!(
+                "Payment state is not PAYMENT_STATE_SENT, got {}",
+                status
+            )));
         }
 
         let expected_call_bytes = {
-            let expected_value = try_s!(wei_from_big_decimal(&amount, self.utxo.decimals));
-            let my_address = try_s!(self.utxo.derivation_method.iguana_or_err()).clone();
-            let expected_receiver = try_s!(qtum::contract_addr_from_utxo_addr(my_address));
-            try_s!(self.erc20_payment_call_bytes(
+            let expected_value = wei_from_big_decimal(&amount, self.utxo.decimals)?;
+            let my_address = self.utxo.derivation_method.single_addr_or_err()?.clone();
+            let expected_receiver = qtum::contract_addr_from_utxo_addr(my_address)
+                .mm_err(|err| ValidatePaymentError::InternalError(err.to_string()))?;
+            self.erc20_payment_call_bytes(
                 expected_swap_id,
                 expected_value,
                 time_lock,
                 &secret_hash,
-                expected_receiver
-            ))
+                expected_receiver,
+            )?
         };
-
-        let erc20_payment = try_s!(self.erc20_payment_details_from_tx(&payment_tx).await);
+        let erc20_payment = self
+            .erc20_payment_details_from_tx(&payment_tx)
+            .await
+            .map_to_mm(ValidatePaymentError::TxDeserializationError)?;
         if erc20_payment.contract_call_bytes != expected_call_bytes {
-            return ERR!(
+            return MmError::err(ValidatePaymentError::WrongPaymentTx(format!(
                 "Unexpected 'erc20Payment' contract call bytes: {:?}",
                 erc20_payment.contract_call_bytes
-            );
+            )));
         }
 
         if sender != erc20_payment.sender {
-            return ERR!("Payment tx was sent from wrong address, expected {:?}", sender);
+            return MmError::err(ValidatePaymentError::WrongPaymentTx(format!(
+                "Payment tx {:?} was sent from wrong address, expected {:?}",
+                erc20_payment.sender, sender
+            )));
         }
 
         if expected_swap_contract_address != erc20_payment.swap_contract_address {
-            return ERR!(
-                "Payment tx was sent to wrong address, expected {:?}",
-                expected_swap_contract_address
-            );
+            return MmError::err(ValidatePaymentError::WrongPaymentTx(format!(
+                "Payment tx receiver arg {:?} is invalid, expected {:?}",
+                erc20_payment.swap_contract_address, expected_swap_contract_address,
+            )));
         }
 
         Ok(())
@@ -247,7 +262,7 @@ impl Qrc20Coin {
         }
 
         // Else try to find a 'senderRefund' contract call.
-        let my_address = try_s!(self.utxo.derivation_method.iguana_or_err()).clone();
+        let my_address = try_s!(self.utxo.derivation_method.single_addr_or_err()).clone();
         let sender = try_s!(qtum::contract_addr_from_utxo_addr(my_address));
         let refund_txs = try_s!(self.sender_refund_transactions(sender, search_from_block).await);
         let found = refund_txs.into_iter().find(|tx| {
@@ -271,7 +286,7 @@ impl Qrc20Coin {
             return Ok(None);
         };
 
-        let my_address = try_s!(self.utxo.derivation_method.iguana_or_err()).clone();
+        let my_address = try_s!(self.utxo.derivation_method.single_addr_or_err()).clone();
         let sender = try_s!(qtum::contract_addr_from_utxo_addr(my_address));
         let erc20_payment_txs = try_s!(self.erc20_payment_transactions(sender, search_from_block).await);
         let found = erc20_payment_txs
@@ -282,6 +297,12 @@ impl Qrc20Coin {
     }
 
     pub fn extract_secret_impl(&self, secret_hash: &[u8], spend_tx: &[u8]) -> Result<Vec<u8>, String> {
+        let secret_hash = if secret_hash.len() == 32 {
+            ripemd160(secret_hash)
+        } else {
+            chain::hash::H160::from(secret_hash)
+        };
+
         let spend_tx: UtxoTx = try_s!(deserialize(spend_tx).map_err(|e| ERRL!("{:?}", e)));
         let spend_tx_hash: H256Json = spend_tx.hash().reversed().into();
         for output in spend_tx.outputs {
@@ -296,7 +317,7 @@ impl Qrc20Coin {
                     },
                 };
 
-            let actual_secret_hash = &*dhash160(&secret);
+            let actual_secret_hash = dhash160(&secret);
             if actual_secret_hash != secret_hash {
                 warn!(
                     "invalid 'dhash160(secret)' {:?}, expected {:?}",
@@ -316,6 +337,7 @@ impl Qrc20Coin {
         tx: UtxoTx,
         wait_until: u64,
         from_block: u64,
+        check_every: f64,
     ) -> Result<TransactionEnum, String> {
         let Erc20PaymentDetails {
             swap_id,
@@ -339,7 +361,7 @@ impl Qrc20Coin {
             if now_ms() / 1000 > wait_until {
                 return ERR!("Waited too long until {} for {:?} to be spent ", wait_until, tx);
             }
-            Timer::sleep(10.).await;
+            Timer::sleep(check_every).await;
         }
     }
 
@@ -436,7 +458,7 @@ impl Qrc20Coin {
         let my_address = self
             .utxo
             .derivation_method
-            .iguana_or_err()
+            .single_addr_or_err()
             .mm_err(|e| UtxoRpcError::Internal(e.to_string()))?;
         let tokens = self
             .utxo
@@ -466,26 +488,28 @@ impl Qrc20Coin {
 
     /// Get payment status by `swap_id`.
     /// Do not use self swap_contract_address, because it could be updated during restart.
-    async fn payment_status(&self, swap_contract_address: &H160, swap_id: Vec<u8>) -> Result<U256, String> {
-        let decoded = try_s!(
-            self.utxo
-                .rpc_client
-                .rpc_contract_call(ViewContractCallType::Payments, swap_contract_address, &[
-                    Token::FixedBytes(swap_id)
-                ])
-                .compat()
-                .await
-        );
+    async fn payment_status(&self, swap_contract_address: &H160, swap_id: Vec<u8>) -> MmResult<U256, UtxoRpcError> {
+        let decoded = self
+            .utxo
+            .rpc_client
+            .rpc_contract_call(ViewContractCallType::Payments, swap_contract_address, &[
+                Token::FixedBytes(swap_id),
+            ])
+            .compat()
+            .await?;
         if decoded.len() < 3 {
-            return ERR!(
+            return MmError::err(UtxoRpcError::InvalidResponse(format!(
                 "Expected at least 3 tokens in \"payments\" call, found {}",
                 decoded.len()
-            );
+            )));
         }
 
         match decoded[2] {
             Token::Uint(state) => Ok(state),
-            _ => ERR!("Payment status must be uint, got {:?}", decoded[2]),
+            _ => MmError::err(UtxoRpcError::InvalidResponse(format!(
+                "Payment status must be uint, got {:?}",
+                decoded[2]
+            ))),
         }
     }
 
@@ -923,6 +947,12 @@ fn find_receiver_spend_with_swap_id_and_secret_hash(
     expected_swap_id: &[u8],
     expected_secret_hash: &[u8],
 ) -> Option<usize> {
+    let expected_secret_hash = if expected_secret_hash.len() == 32 {
+        ripemd160(expected_secret_hash)
+    } else {
+        chain::hash::H160::from(expected_secret_hash)
+    };
+
     for (output_idx, output) in tx.outputs.iter().enumerate() {
         let script_pubkey: Script = output.script_pubkey.clone().into();
         let ReceiverSpendDetails { swap_id, secret, .. } =
@@ -938,7 +968,7 @@ fn find_receiver_spend_with_swap_id_and_secret_hash(
             continue;
         }
 
-        let secret_hash = &*dhash160(&secret);
+        let secret_hash = dhash160(&secret);
         if secret_hash != expected_secret_hash {
             warn!(
                 "invalid 'dhash160(secret)' {:?}, expected {:?}",

@@ -1,10 +1,15 @@
 use compact::Compact;
 use crypto::dhash256;
+#[cfg(not(target_arch = "wasm32"))]
+use ext_bitcoin::blockdata::block::BlockHeader as ExtBlockHeader;
+#[cfg(not(target_arch = "wasm32"))]
+use ext_bitcoin::hash_types::{BlockHash as ExtBlockHash, TxMerkleNode as ExtTxMerkleNode};
 use hash::H256;
 use hex::FromHex;
 use primitives::bytes::Bytes;
 use primitives::U256;
 use ser::{deserialize, serialize, Deserializable, Reader, Serializable, Stream};
+use std::convert::TryFrom;
 use std::io;
 use transaction::{deserialize_tx, TxType};
 use {OutPoint, Transaction};
@@ -39,7 +44,26 @@ impl Serializable for BlockHeaderBits {
     }
 }
 
+impl From<BlockHeaderBits> for u32 {
+    fn from(bits: BlockHeaderBits) -> Self {
+        match bits {
+            BlockHeaderBits::Compact(c) => c.into(),
+            BlockHeaderBits::U32(n) => n,
+        }
+    }
+}
+
+impl From<BlockHeaderBits> for Compact {
+    fn from(bits: BlockHeaderBits) -> Self {
+        match bits {
+            BlockHeaderBits::Compact(c) => c,
+            BlockHeaderBits::U32(n) => Compact::new(n),
+        }
+    }
+}
+
 const AUX_POW_VERSION_DOGE: u32 = 6422788;
+const AUX_POW_VERSION_NMC: u32 = 65796;
 const AUX_POW_VERSION_SYS: u32 = 537919744;
 const MTP_POW_VERSION: u32 = 0x20001000u32;
 const PROG_POW_SWITCH_TIME: u32 = 1635228000;
@@ -142,7 +166,8 @@ impl Serializable for BlockHeader {
         };
         s.append(&self.time);
         s.append(&self.bits);
-        if !self.is_prog_pow() && self.version != KAWPOW_VERSION {
+        // If a BTC header uses KAWPOW_VERSION, the nonce can't be zero
+        if !self.is_prog_pow() && (self.version != KAWPOW_VERSION || self.nonce != BlockHeaderNonce::U32(0)) {
             s.append(&self.nonce);
         }
         if let Some(sol) = &self.solution {
@@ -210,24 +235,37 @@ impl Deserializable for BlockHeader {
             None
         };
 
-        let hash_final_sapling_root = if version == 4 { Some(reader.read()?) } else { None };
+        let hash_final_sapling_root = if version == 4 && !reader.coin_variant().is_btc() {
+            Some(reader.read()?)
+        } else {
+            None
+        };
         let time = reader.read()?;
-        let bits = if version == 4 {
+        let bits = if version == 4 && !reader.coin_variant().is_btc() {
             BlockHeaderBits::U32(reader.read()?)
         } else {
             BlockHeaderBits::Compact(reader.read()?)
         };
-        let nonce = if version == 4 {
+        let nonce = if version == 4 && !reader.coin_variant().is_btc() {
             BlockHeaderNonce::H256(reader.read()?)
-        } else if version == KAWPOW_VERSION || version == MTP_POW_VERSION && time >= PROG_POW_SWITCH_TIME {
+        } else if (version == KAWPOW_VERSION && !reader.coin_variant().is_btc())
+            || version == MTP_POW_VERSION && time >= PROG_POW_SWITCH_TIME
+        {
             BlockHeaderNonce::U32(0)
         } else {
             BlockHeaderNonce::U32(reader.read()?)
         };
-        let solution = if version == 4 { Some(reader.read_list()?) } else { None };
+        let solution = if version == 4 && !reader.coin_variant().is_btc() {
+            Some(reader.read_list()?)
+        } else {
+            None
+        };
 
         // https://en.bitcoin.it/wiki/Merged_mining_specification#Merged_mining_coinbase
-        let aux_pow = if version == AUX_POW_VERSION_DOGE || version == AUX_POW_VERSION_SYS {
+        let aux_pow = if matches!(
+            version,
+            AUX_POW_VERSION_DOGE | AUX_POW_VERSION_SYS | AUX_POW_VERSION_NMC
+        ) {
             let coinbase_tx = deserialize_tx(reader, TxType::StandardWithWitness)?;
             let parent_block_hash = reader.read()?;
             let coinbase_branch = reader.read()?;
@@ -269,7 +307,7 @@ impl Deserializable for BlockHeader {
             };
 
         // https://github.com/RavenProject/Ravencoin/blob/61c790447a5afe150d9892705ac421d595a2df60/src/primitives/block.h#L67
-        let (n_height, n_nonce_u64, mix_hash) = if version == KAWPOW_VERSION {
+        let (n_height, n_nonce_u64, mix_hash) = if version == KAWPOW_VERSION && !reader.coin_variant().is_btc() {
             (Some(reader.read()?), Some(reader.read()?), Some(reader.read()?))
         } else {
             (None, None, None)
@@ -317,11 +355,45 @@ impl From<&'static str> for BlockHeader {
     fn from(s: &'static str) -> Self { deserialize(&s.from_hex::<Vec<u8>>().unwrap() as &[u8]).unwrap() }
 }
 
+impl TryFrom<String> for BlockHeader {
+    type Error = ser::Error;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        deserialize(
+            &s.from_hex::<Vec<u8>>()
+                .map_err(|e| Self::Error::Custom(e.to_string()))? as &[u8],
+        )
+    }
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl From<BlockHeader> for ExtBlockHeader {
+    fn from(header: BlockHeader) -> Self {
+        let prev_blockhash = ExtBlockHash::from_hash(header.previous_header_hash.to_sha256d());
+        let merkle_root = ExtTxMerkleNode::from_hash(header.merkle_root_hash.to_sha256d());
+        // note: H256 nonce is not supported for bitcoin, we will just set nonce to 0 in this case since this will never happen
+        let nonce = match header.nonce {
+            BlockHeaderNonce::U32(n) => n,
+            _ => 0,
+        };
+        ExtBlockHeader {
+            version: header.version as i32,
+            prev_blockhash,
+            merkle_root,
+            time: header.time,
+            bits: header.bits.into(),
+            nonce,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use block_header::{BlockHeader, BlockHeaderBits, BlockHeaderNonce, AUX_POW_VERSION_DOGE, AUX_POW_VERSION_SYS,
-                       BIP9_NO_SOFT_FORK_BLOCK_HEADER_VERSION, KAWPOW_VERSION, MTP_POW_VERSION, PROG_POW_SWITCH_TIME};
+    use super::ExtBlockHeader;
+    use block_header::{BlockHeader, BlockHeaderBits, BlockHeaderNonce, AUX_POW_VERSION_DOGE, AUX_POW_VERSION_NMC,
+                       AUX_POW_VERSION_SYS, BIP9_NO_SOFT_FORK_BLOCK_HEADER_VERSION, KAWPOW_VERSION, MTP_POW_VERSION,
+                       PROG_POW_SWITCH_TIME};
     use hex::FromHex;
+    use primitives::bytes::Bytes;
     use ser::{deserialize, serialize, serialize_list, CoinVariant, Error as ReaderError, Reader, Stream};
 
     #[test]
@@ -977,6 +1049,24 @@ mod tests {
         let headers = reader.read_list::<BlockHeader>().unwrap();
         for header in headers.iter() {
             assert_eq!(header.version, BIP9_NO_SOFT_FORK_BLOCK_HEADER_VERSION);
+        }
+        let serialized = serialize_list(&headers);
+        assert_eq!(serialized.take(), headers_bytes);
+    }
+
+    #[test]
+    fn test_nmc_block_headers_serde_11() {
+        // NMC block headers
+        // start - #622807
+        // end - #622796
+        // Ref: https://chainz.cryptoid.info/nmc/block.dws?622807.htm
+        let headers_bytes: Bytes = include_str!("for_tests/nmc_block_headers_hex").into();
+        let headers_bytes = headers_bytes.as_slice();
+        let mut reader = Reader::new(headers_bytes);
+        let headers = reader.read_list::<BlockHeader>().unwrap();
+        for header in headers.iter() {
+            assert_eq!(header.version, AUX_POW_VERSION_NMC);
+            assert!(header.aux_pow.is_some());
         }
         let serialized = serialize_list(&headers);
         assert_eq!(serialized.take(), headers_bytes);
@@ -2386,5 +2476,40 @@ mod tests {
         }
         let serialized = serialize_list(&headers);
         assert_eq!(serialized.take(), headers_bytes);
+    }
+
+    #[test]
+    fn test_btc_v4_block_headers_serde_11() {
+        // https://live.blockcypher.com/btc/block/0000000000000000097336f8439779072501753e2f48b8798c66188139f2d9cf/
+        let header = "04000000462a79dfa51b541648ee55df74cdc14b9ea7feb932e912060000000000000000374c1707a72691be50070bc5029d586e9200d672c6c3dfd29d267bf6b2b01b9e0ace395654a91118923bd9d5";
+        let header_bytes = &header.from_hex::<Vec<u8>>().unwrap() as &[u8];
+        let mut reader = Reader::new_with_coin_variant(header_bytes, CoinVariant::BTC);
+        let header = reader.read::<BlockHeader>().unwrap();
+        assert_eq!(header.version, 4);
+        let serialized = serialize(&header);
+        assert_eq!(serialized.take(), header_bytes);
+    }
+
+    #[test]
+    fn test_btc_kow_pow_version_block_headers_serde_11() {
+        // https://live.blockcypher.com/btc/block/000000000000000006e35d6675fb0fec767a5f3b346261a5160f6e2a8d258070/
+        let header = "00000030af7e7389ca428b05d8902fcdc148e70974524d39cb56bc0100000000000000007ce0cd0c9c648d1b585d29b9ab23ebc987619d43925b3c768d7cb4bc097cfb821441c05614a107187aef1ee1";
+        let header_bytes = &header.from_hex::<Vec<u8>>().unwrap() as &[u8];
+        let mut reader = Reader::new_with_coin_variant(header_bytes, CoinVariant::BTC);
+        let header = reader.read::<BlockHeader>().unwrap();
+        assert_eq!(header.version, KAWPOW_VERSION);
+        let serialized = serialize(&header);
+        assert_eq!(serialized.take(), header_bytes);
+    }
+
+    #[test]
+    fn test_from_blockheader_to_ext_blockheader() {
+        // https://live.blockcypher.com/btc/block/00000000000000000020cf2bdc6563fb25c424af588d5fb7223461e72715e4a9/
+        let header: BlockHeader = "0200000066720b99e07d284bd4fe67ff8c49a5db1dd8514fcdab610000000000000000007829844f4c3a41a537b3131ca992643eaa9d093b2383e4cdc060ad7dc548118751eb505ac1910018de19b302".into();
+        let ext_header = ExtBlockHeader::from(header.clone());
+        assert_eq!(
+            header.hash().reversed().to_string(),
+            ext_header.block_hash().to_string()
+        );
     }
 }

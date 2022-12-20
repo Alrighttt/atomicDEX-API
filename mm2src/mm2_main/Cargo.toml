@@ -7,38 +7,15 @@
 name = "mm2_main"
 version = "0.1.0"
 edition = "2018"
-default-run = "mm2"
-
-# wasm-opt reduces the size from 17 Mb to 14. But it runs for few minutes, which is not good for CI.
-# For production builds, it's recommended to run wasm-opt separately.
-[package.metadata.wasm-pack.profile.release]
-wasm-opt = false
-
-[features]
-# Deprecated
-native = []
-track-ctx-pointer = ["common/track-ctx-pointer"]
-custom-swap-locktime = [] # only for testing purposes, should never be activated on release builds.
-zhtlc-native-tests = ["coins/zhtlc-native-tests"]
-
-[[bin]]
-name = "mm2"
-path = "src/mm2_bin.rs"
-test = false
-doctest = false
-bench = false
-
-[[bin]]
-name = "docker_tests"
-path = "src/docker_tests.rs"
 
 [lib]
-name = "mm2"
-path = "src/mm2_lib.rs"
-crate-type = ["cdylib", "staticlib"]
-test = false
 doctest = false
-bench = false
+
+[features]
+custom-swap-locktime = [] # only for testing purposes, should never be activated on release builds.
+native = [] # Deprecated
+track-ctx-pointer = ["common/track-ctx-pointer"]
+zhtlc-native-tests = ["coins/zhtlc-native-tests"]
 
 [dependencies]
 async-std = { version = "1.5", features = ["unstable"] }
@@ -58,10 +35,12 @@ db_common = { path = "../db_common" }
 derive_more = "0.99"
 either = "1.6"
 ethereum-types = { version = "0.4", default-features = false, features = ["std", "serialize"] }
+enum_from = { path = "../derives/enum_from" }
 enum-primitive-derive = "0.2"
 futures01 = { version = "0.1", package = "futures" }
 futures = { version = "0.3.1", package = "futures", features = ["compat", "async-await"] }
 gstuff = { version = "0.7", features = ["nightly"] }
+mm2_gui_storage = { path = "../mm2_gui_storage" }
 hash256-std-hasher = "0.15.2"
 hash-db = "0.15.2"
 hex = "0.4.2"
@@ -72,11 +51,11 @@ keys = { path = "../mm2_bitcoin/keys" }
 lazy_static = "1.4"
 # ledger = { path = "../ledger" }
 libc = "0.2"
-metrics = "0.12"
 mm2_core = { path = "../mm2_core" }
 mm2_err_handle = { path = "../mm2_err_handle" }
 mm2_io = { path = "../mm2_io" }
 mm2-libp2p = { path = "../mm2_libp2p" }
+mm2_metrics = { path = "../mm2_metrics" }
 mm2_net = { path = "../mm2_net" }
 mm2_number = { path = "../mm2_number" }
 mm2_rpc = { path = "../mm2_rpc" }
