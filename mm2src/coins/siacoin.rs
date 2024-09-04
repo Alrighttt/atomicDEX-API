@@ -40,6 +40,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
+use serde::{Serialize, Serializer};
 
 pub mod sia_hd_wallet;
 mod sia_withdraw;
@@ -933,6 +934,30 @@ pub enum SiaTransactionTypes {
     EventPayout(EventPayout),
 }
 
+// FIXME FIXME FIXME FIXME
+// Temporary hack to make the front end happy with withdraw -> send_raw_transaction
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct SiaTxTypesHack(pub SiaTransactionTypes);
+
+impl Deref for SiaTxTypesHack {
+    type Target = SiaTransactionTypes;
+    fn deref(&self) -> &SiaTransactionTypes { &self.0 }
+}
+
+impl Serialize for SiaTxTypesHack {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        // First, serialize `SiaTransactionTypes` to a JSON string.
+        let json_string = serde_json::to_string(&self.0)
+            .map_err(serde::ser::Error::custom)?;
+
+        // Serialize the JSON string as a regular string, ensuring it is escaped properly.
+        serializer.serialize_str(&json_string)
+    }
+}
+
 impl SiaCoin {
     async fn get_unspent_outputs(&self, address: Address) -> Result<AddressUtxosResponse, MmError<SiaApiClientError>> {
         let request = AddressUtxosRequest { address };
@@ -1006,7 +1031,7 @@ impl SiaCoin {
 
                 Ok(TransactionDetails {
                     tx: TransactionData::Sia {
-                        tx_json: SiaTransactionTypes::V2Transaction(tx.clone()),
+                        tx_json: SiaTxTypesHack(SiaTransactionTypes::V2Transaction(tx.clone())),
                         tx_hash: txid,
                     },
                     from,
@@ -1078,7 +1103,7 @@ impl SiaCoin {
 
                 Ok(TransactionDetails {
                     tx: TransactionData::Sia {
-                        tx_json: SiaTransactionTypes::V1Transaction(tx.transaction.clone()),
+                        tx_json: SiaTxTypesHack(SiaTransactionTypes::V1Transaction(tx.transaction.clone())),
                         tx_hash: txid,
                     },
                     from,
@@ -1125,7 +1150,7 @@ impl SiaCoin {
 
                 Ok(TransactionDetails {
                     tx: TransactionData::Sia {
-                        tx_json: SiaTransactionTypes::EventPayout(event_payout.clone()),
+                        tx_json: SiaTxTypesHack(SiaTransactionTypes::EventPayout(event_payout.clone())),
                         tx_hash: txid,
                     },
                     from,

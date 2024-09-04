@@ -279,7 +279,7 @@ pub mod tx_history_storage;
 #[cfg(feature = "enable-sia")] pub mod siacoin;
 #[cfg(feature = "enable-sia")] use crate::siacoin::SiaFeeDetails;
 #[cfg(feature = "enable-sia")]
-use siacoin::{SiaCoin, SiaTransactionTypes};
+use siacoin::{SiaCoin, SiaTransactionTypes, SiaTxTypesHack};
 
 #[doc(hidden)]
 #[allow(unused_variables)]
@@ -2343,7 +2343,8 @@ pub enum TransactionData {
     #[cfg(feature = "enable-sia")]
     Sia {
         /// SIA transactions are broadcasted in JSON format
-        tx_json: SiaTransactionTypes,
+        #[serde(rename="tx_hex")] // FIXME komodo-wallet expectts this field
+        tx_json: SiaTxTypesHack,
         /// Transaction hash in hexadecimal format
         tx_hash: String,
     },

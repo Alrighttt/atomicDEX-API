@@ -1,4 +1,4 @@
-use crate::siacoin::{siacoin_from_hastings, siacoin_to_hastings, SiaCoin, SiaFeeDetails, SiaTransactionTypes};
+use crate::siacoin::{siacoin_from_hastings, siacoin_to_hastings, SiaCoin, SiaFeeDetails, SiaTransactionTypes, SiaTxTypesHack};
 use crate::{MarketCoinOps, PrivKeyPolicy, TransactionData, TransactionDetails, TransactionType, WithdrawError,
             WithdrawRequest, WithdrawResult};
 use common::now_sec;
@@ -137,7 +137,7 @@ impl<'a> SiaWithdrawBuilder<'a> {
 
         Ok(TransactionDetails {
             tx: TransactionData::Sia {
-                tx_json: SiaTransactionTypes::V2Transaction(signed_tx.clone()),
+                tx_json: SiaTxTypesHack(SiaTransactionTypes::V2Transaction(signed_tx.clone())),
                 tx_hash: signed_tx.txid().to_string(),
             },
             from: vec![self.from_address.to_string()],
