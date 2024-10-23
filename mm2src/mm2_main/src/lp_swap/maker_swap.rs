@@ -844,12 +844,12 @@ impl MakerSwap {
                     let payment_fut = self.maker_coin.send_maker_payment(SendPaymentArgs {
                         time_lock_duration: self.r().data.lock_duration,
                         time_lock: self.r().data.maker_payment_lock,
-                        other_pubkey: &*self.r().other_maker_coin_htlc_pub,
-                        secret_hash: secret_hash.as_slice(),
+                        other_pubkey: (&*self.r().other_maker_coin_htlc_pub).to_vec(),
+                        secret_hash,
                         amount: self.maker_amount.clone(),
-                        swap_contract_address: &self.r().data.maker_coin_swap_contract_address,
-                        swap_unique_data: &unique_data,
-                        payment_instructions: &self.r().payment_instructions,
+                        swap_contract_address: self.r().data.maker_coin_swap_contract_address.clone(),
+                        swap_unique_data: unique_data,
+                        payment_instructions: self.r().payment_instructions.clone(),
                         watcher_reward,
                         wait_for_confirmation_until: wait_maker_payment_until,
                     });

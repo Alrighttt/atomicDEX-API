@@ -1507,7 +1507,7 @@ pub fn send_maker_payment<T>(coin: T, args: SendPaymentArgs) -> TransactionFut
 where
     T: UtxoCommonOps + GetUtxoListOps + SwapOps,
 {
-    let maker_htlc_key_pair = coin.derive_htlc_key_pair(args.swap_unique_data);
+    let maker_htlc_key_pair = coin.derive_htlc_key_pair(&args.swap_unique_data);
     let SwapPaymentOutputsResult {
         payment_address,
         outputs,
@@ -1515,10 +1515,10 @@ where
         &coin,
         try_tx_fus!(args.time_lock.try_into()),
         maker_htlc_key_pair.public_slice(),
-        args.other_pubkey,
+        &args.other_pubkey,
         args.amount,
         SwapTxTypeWithSecretHash::TakerOrMakerPayment {
-            maker_secret_hash: args.secret_hash
+            maker_secret_hash: &args.secret_hash
         },
     ));
     let send_fut = match &coin.as_ref().rpc_client {
@@ -1545,7 +1545,7 @@ where
         None => args.amount,
     };
 
-    let taker_htlc_key_pair = coin.derive_htlc_key_pair(args.swap_unique_data);
+    let taker_htlc_key_pair = coin.derive_htlc_key_pair(&args.swap_unique_data);
     let SwapPaymentOutputsResult {
         payment_address,
         outputs,
@@ -1553,10 +1553,10 @@ where
         &coin,
         try_tx_fus!(args.time_lock.try_into()),
         taker_htlc_key_pair.public_slice(),
-        args.other_pubkey,
+        &args.other_pubkey,
         total_amount,
         SwapTxTypeWithSecretHash::TakerOrMakerPayment {
-            maker_secret_hash: args.secret_hash
+            maker_secret_hash: &args.secret_hash
         },
     ));
 

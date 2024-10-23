@@ -773,10 +773,10 @@ impl SwapOps for Qrc20Coin {
 
     fn send_maker_payment(&self, maker_payment_args: SendPaymentArgs) -> TransactionFut {
         let time_lock = try_tx_fus!(maker_payment_args.time_lock.try_into());
-        let taker_addr = try_tx_fus!(self.contract_address_from_raw_pubkey(maker_payment_args.other_pubkey));
-        let id = qrc20_swap_id(time_lock, maker_payment_args.secret_hash);
+        let taker_addr = try_tx_fus!(self.contract_address_from_raw_pubkey(&maker_payment_args.other_pubkey));
+        let id = qrc20_swap_id(time_lock, &maker_payment_args.secret_hash);
         let value = try_tx_fus!(wei_from_big_decimal(&maker_payment_args.amount, self.utxo.decimals));
-        let secret_hash = Vec::from(maker_payment_args.secret_hash);
+        let secret_hash = maker_payment_args.secret_hash;
         let swap_contract_address = try_tx_fus!(maker_payment_args.swap_contract_address.try_to_address());
 
         let selfi = self.clone();
@@ -791,8 +791,8 @@ impl SwapOps for Qrc20Coin {
     #[inline]
     fn send_taker_payment(&self, taker_payment_args: SendPaymentArgs) -> TransactionFut {
         let time_lock = try_tx_fus!(taker_payment_args.time_lock.try_into());
-        let maker_addr = try_tx_fus!(self.contract_address_from_raw_pubkey(taker_payment_args.other_pubkey));
-        let id = qrc20_swap_id(time_lock, taker_payment_args.secret_hash);
+        let maker_addr = try_tx_fus!(self.contract_address_from_raw_pubkey(&taker_payment_args.other_pubkey));
+        let id = qrc20_swap_id(time_lock, &taker_payment_args.secret_hash);
         let value = try_tx_fus!(wei_from_big_decimal(&taker_payment_args.amount, self.utxo.decimals));
         let secret_hash = Vec::from(taker_payment_args.secret_hash);
         let swap_contract_address = try_tx_fus!(taker_payment_args.swap_contract_address.try_to_address());

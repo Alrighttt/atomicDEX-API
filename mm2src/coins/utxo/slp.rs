@@ -1239,10 +1239,10 @@ impl SwapOps for SlpToken {
     }
 
     fn send_maker_payment(&self, maker_payment_args: SendPaymentArgs) -> TransactionFut {
-        let taker_pub = try_tx_fus!(Public::from_slice(maker_payment_args.other_pubkey));
+        let taker_pub = try_tx_fus!(Public::from_slice(&maker_payment_args.other_pubkey));
         let amount = try_tx_fus!(sat_from_big_decimal(&maker_payment_args.amount, self.decimals()));
         let secret_hash = maker_payment_args.secret_hash.to_owned();
-        let maker_htlc_keypair = self.derive_htlc_key_pair(maker_payment_args.swap_unique_data);
+        let maker_htlc_keypair = self.derive_htlc_key_pair(&maker_payment_args.swap_unique_data);
         let time_lock = try_tx_fus!(maker_payment_args.time_lock.try_into());
 
         let coin = self.clone();
@@ -1257,11 +1257,11 @@ impl SwapOps for SlpToken {
     }
 
     fn send_taker_payment(&self, taker_payment_args: SendPaymentArgs) -> TransactionFut {
-        let maker_pub = try_tx_fus!(Public::from_slice(taker_payment_args.other_pubkey));
+        let maker_pub = try_tx_fus!(Public::from_slice(&taker_payment_args.other_pubkey));
         let amount = try_tx_fus!(sat_from_big_decimal(&taker_payment_args.amount, self.decimals()));
         let secret_hash = taker_payment_args.secret_hash.to_owned();
 
-        let taker_htlc_keypair = self.derive_htlc_key_pair(taker_payment_args.swap_unique_data);
+        let taker_htlc_keypair = self.derive_htlc_key_pair(&taker_payment_args.swap_unique_data);
         let time_lock = try_tx_fus!(taker_payment_args.time_lock.try_into());
 
         let coin = self.clone();

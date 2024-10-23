@@ -615,7 +615,7 @@ impl SwapOps for LightningCoin {
         Box::new(fut.boxed().compat())
     }
 
-    fn send_maker_payment(&self, maker_payment_args: SendPaymentArgs<'_>) -> TransactionFut {
+    fn send_maker_payment(&self, maker_payment_args: SendPaymentArgs) -> TransactionFut {
         let invoice = match maker_payment_args.payment_instructions.clone() {
             Some(PaymentInstructions::Lightning(invoice)) => invoice,
             _ => try_tx_fus!(ERR!("Invalid instructions, ligntning invoice is expected")),
@@ -630,7 +630,7 @@ impl SwapOps for LightningCoin {
         Box::new(fut.boxed().compat())
     }
 
-    fn send_taker_payment(&self, taker_payment_args: SendPaymentArgs<'_>) -> TransactionFut {
+    fn send_taker_payment(&self, taker_payment_args: SendPaymentArgs) -> TransactionFut {
         let invoice = match taker_payment_args.payment_instructions.clone() {
             Some(PaymentInstructions::Lightning(invoice)) => invoice,
             _ => try_tx_fus!(ERR!("Invalid instructions, ligntning invoice is expected")),

@@ -1573,12 +1573,12 @@ impl TakerSwap {
                     let payment_fut = self.taker_coin.send_taker_payment(SendPaymentArgs {
                         time_lock_duration: self.r().data.lock_duration,
                         time_lock,
-                        other_pubkey: &*self.r().other_taker_coin_htlc_pub,
-                        secret_hash: &self.r().secret_hash.0,
+                        other_pubkey: (&*self.r().other_taker_coin_htlc_pub).to_vec(),
+                        secret_hash: self.r().secret_hash.0.clone(),
                         amount: self.taker_amount.to_decimal(),
-                        swap_contract_address: &self.r().data.taker_coin_swap_contract_address,
-                        swap_unique_data: &unique_data,
-                        payment_instructions: &self.r().payment_instructions,
+                        swap_contract_address: self.r().data.taker_coin_swap_contract_address.clone(),
+                        swap_unique_data: unique_data,
+                        payment_instructions: self.r().payment_instructions.clone(),
                         watcher_reward,
                         wait_for_confirmation_until: self.r().data.taker_payment_lock,
                     });

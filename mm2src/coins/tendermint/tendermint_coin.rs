@@ -2705,8 +2705,8 @@ impl SwapOps for TendermintCoin {
     fn send_maker_payment(&self, maker_payment_args: SendPaymentArgs) -> TransactionFut {
         self.send_htlc_for_denom(
             maker_payment_args.time_lock_duration,
-            maker_payment_args.other_pubkey,
-            maker_payment_args.secret_hash,
+            &maker_payment_args.other_pubkey,
+            &maker_payment_args.secret_hash,
             maker_payment_args.amount,
             self.denom.clone(),
             self.decimals,
@@ -2716,8 +2716,8 @@ impl SwapOps for TendermintCoin {
     fn send_taker_payment(&self, taker_payment_args: SendPaymentArgs) -> TransactionFut {
         self.send_htlc_for_denom(
             taker_payment_args.time_lock_duration,
-            taker_payment_args.other_pubkey,
-            taker_payment_args.secret_hash,
+            &taker_payment_args.other_pubkey,
+            &taker_payment_args.secret_hash,
             taker_payment_args.amount,
             self.denom.clone(),
             self.decimals,

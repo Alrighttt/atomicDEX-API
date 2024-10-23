@@ -1210,10 +1210,10 @@ impl SwapOps for ZCoin {
         Box::new(fut.boxed().compat())
     }
 
-    fn send_maker_payment(&self, maker_payment_args: SendPaymentArgs<'_>) -> TransactionFut {
+    fn send_maker_payment(&self, maker_payment_args: SendPaymentArgs) -> TransactionFut {
         let selfi = self.clone();
-        let maker_key_pair = self.derive_htlc_key_pair(maker_payment_args.swap_unique_data);
-        let taker_pub = try_tx_fus!(Public::from_slice(maker_payment_args.other_pubkey));
+        let maker_key_pair = self.derive_htlc_key_pair(&maker_payment_args.swap_unique_data);
+        let taker_pub = try_tx_fus!(Public::from_slice(&maker_payment_args.other_pubkey));
         let secret_hash = maker_payment_args.secret_hash.to_vec();
         let time_lock = try_tx_fus!(maker_payment_args.time_lock.try_into());
         let amount = maker_payment_args.amount;
@@ -1234,10 +1234,10 @@ impl SwapOps for ZCoin {
         Box::new(fut.boxed().compat())
     }
 
-    fn send_taker_payment(&self, taker_payment_args: SendPaymentArgs<'_>) -> TransactionFut {
+    fn send_taker_payment(&self, taker_payment_args: SendPaymentArgs) -> TransactionFut {
         let selfi = self.clone();
-        let taker_keypair = self.derive_htlc_key_pair(taker_payment_args.swap_unique_data);
-        let maker_pub = try_tx_fus!(Public::from_slice(taker_payment_args.other_pubkey));
+        let taker_keypair = self.derive_htlc_key_pair(&taker_payment_args.swap_unique_data);
+        let maker_pub = try_tx_fus!(Public::from_slice(&taker_payment_args.other_pubkey));
         let secret_hash = taker_payment_args.secret_hash.to_vec();
         let time_lock = try_tx_fus!(taker_payment_args.time_lock.try_into());
         let amount = taker_payment_args.amount;

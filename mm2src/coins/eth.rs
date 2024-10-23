@@ -3657,16 +3657,16 @@ impl EthCoin {
         }
     }
 
-    fn send_hash_time_locked_payment(&self, args: SendPaymentArgs<'_>) -> EthTxFut {
-        let receiver_addr = try_tx_fus!(addr_from_raw_pubkey(args.other_pubkey));
+    fn send_hash_time_locked_payment(&self, args: SendPaymentArgs) -> EthTxFut {
+        let receiver_addr = try_tx_fus!(addr_from_raw_pubkey(&args.other_pubkey));
         let swap_contract_address = try_tx_fus!(args.swap_contract_address.try_to_address());
-        let id = self.etomic_swap_id(try_tx_fus!(args.time_lock.try_into()), args.secret_hash);
+        let id = self.etomic_swap_id(try_tx_fus!(args.time_lock.try_into()), &args.secret_hash);
         let trade_amount = try_tx_fus!(wei_from_big_decimal(&args.amount, self.decimals));
 
         let time_lock = U256::from(args.time_lock);
 
         let secret_hash = if args.secret_hash.len() == 32 {
-            ripemd160(args.secret_hash).to_vec()
+            ripemd160(&args.secret_hash).to_vec()
         } else {
             args.secret_hash.to_vec()
         };
